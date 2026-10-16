@@ -407,7 +407,7 @@ slice_dt = numpy.dtype([('start', int), ('stop', int), ('eid', U32)])
 
 
 def build_slice_by_event(eids, offset=0):
-    arr = performance.idx_start_stop(eids)
+    arr = performance.idx_start_stop(numpy.array(eids, copy=True))
     sbe = numpy.zeros(len(arr), slice_dt)
     sbe['eid'] = arr[:, 0]
     sbe['start'] = arr[:, 1] + offset
