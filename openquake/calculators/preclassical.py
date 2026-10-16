@@ -24,13 +24,13 @@ import numpy
 from openquake.baselib import general, parallel, hdf5
 from openquake.hazardlib import pmf, geo
 from openquake.baselib.general import AccumDict, groupby
-from openquake.hazardlib.contexts import get_cmakers
+from openquake.hazardlib.rmap_maker import get_cmakers
 from openquake.hazardlib.source.point import grid_point_sources
 from openquake.hazardlib.source.base import get_code2cls
 from openquake.hazardlib.source_group import (
     SourceGroup, _grp_id, NUM_RUPTURES)
-from openquake.hazardlib.source_reader import (
-    get_core_trt_smrs, read_core_trt_smrs)
+from openquake.hazardlib.source_reader import get_core_trt_smrs
+from openquake.hazardlib.rmap_maker import read_core_trt_smrs
 from openquake.hazardlib.calc.filters import (
     getdefault, split_source, SourceFilter)
 from openquake.hazardlib.scalerel.point import PointMSR
@@ -235,7 +235,7 @@ def store_csm(dstore, csm, sitecol, cmakers):
     quartets = []
     for sg, cmaker in zip(csm.src_groups, cmakers.to_array()):
         quartet = csm.split_sg(
-            cmaker, sg, sitecol, max_weight, mb_per_gsim, tiling=oq.tiling)
+            cmaker, sg, sitecol, max_weight, mb_per_gsim)
         quartets.append(quartet)
     # storing _csm
     csm.save(dstore, [q[2] for q in quartets])
@@ -249,22 +249,16 @@ def store_csm(dstore, csm, sitecol, cmakers):
     req_gb = get_req_gb(data, N, oq)
 
     # sanity checks
-    if oq.tiling:
-        assert oq.calculation_mode != 'disaggregation'
-        assert not oq.disagg_by_src
-        assert N > oq.max_sites_disagg
-    else:
-        required_gb = req_gb.sum()
-        avail_gb = psutil.virtual_memory().available / 1024**3
-        if required_gb > avail_gb:
-            raise MemoryError(f'{required_gb:.1f=}, {avail_gb:.1f=}')
-        if 'classical' in oq.calculation_mode:
-            logging.info(f'Requiring {required_gb:.1f} GB for the RateMaps')
+    required_gb = req_gb.sum()
+    avail_gb = psutil.virtual_memory().available / 1024**3
+    if required_gb > avail_gb:
+        raise MemoryError(f'{required_gb:.1f=}, {avail_gb:.1f=}')
+    if 'classical' in oq.calculation_mode:
+        logging.info(f'Requiring {required_gb:.1f} GB for the RateMaps')
 
     # store source groups
     dstore.create_dset('source_groups', data,
-                       attrs=dict(req_gb=req_gb, mem_gb=req_gb.sum(),
-                                  tiling=oq.tiling))
+                       attrs=dict(req_gb=req_gb, mem_gb=req_gb.sum()))
     return max_weight
 
 
@@ -317,23 +311,29 @@ class PreClassicalCalculator(base.HazardCalculator):
         self.store()
         logging.info('Building cmakers')
         trt_smrs = csm.get_trt_smrs()
-        self.cmakers = get_cmakers(trt_smrs, csm.full_lt, oq)
+        # NB: core_trt_smrs is stored by source_reader.build_groups, i.e.
+        # before the preclassical; if the groups were read from the parent
+        # calculation, the core list is taken from the parent
+        parent = self.datastore.parent
+        if 'core_trt_smrs' in self.datastore:
+            core = read_core_trt_smrs(self.datastore)
+        elif parent and 'core_trt_smrs' in parent:
+            core = read_core_trt_smrs(parent)
+        else:
+            core = get_core_trt_smrs(csm.src_groups)
+        self.cmakers = get_cmakers(trt_smrs, csm.full_lt, oq, core)
         self.datastore.hdf5.save_vlen('trt_smrs', trt_smrs)
         sites = csm.sitecol if csm.sitecol else None
         if sites is None:
             logging.warning('No sites??')
 
-        # NB: core_trt_smrs is stored by source_reader.build_groups, i.e.
-        # before the preclassical; the core size Gt, i.e. the number of
-        # columns of the global RateMap, is known already at build time
-        # (see source_reader.store_unc_signatures)
+        # the core size Gt, i.e. the number of columns of the global
+        # RateMap, is known already at build time (see
+        # source_reader.store_unc_signatures)
         if 'core_trt_smrs' not in self.datastore:
             # this happens if the groups were read from the parent
             # calculation, so the units are taken from the parent
-            parent = self.datastore.parent
-            gid = (read_core_trt_smrs(parent) if 'core_trt_smrs' in parent
-                   else get_core_trt_smrs(csm.src_groups))
-            self.datastore.hdf5.save_vlen('core_trt_smrs', gid)
+            self.datastore.hdf5.save_vlen('core_trt_smrs', core)
 
         if sites and not self.few_sites:
             # in SAM from 539,831 -> 11,430 sites

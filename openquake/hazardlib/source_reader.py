@@ -35,7 +35,7 @@ from openquake.hazardlib.source.multi_fault import save_and_split
 from openquake.hazardlib.lt import (
     apply_uncertainties, check_correlated, get_bset_value,
     restrict_ts_samples, ts_samples_dt, get_ts_sets)
-from openquake.hazardlib.contexts import get_unique_inverse
+from openquake.hazardlib.rmap_maker import get_unique_inverse
 from openquake.hazardlib.valid import basename
 
 TWO24 = 2**24
@@ -607,16 +607,6 @@ def get_core_size(core_trt_smrs, full_lt):
                for t in core_trt_smrs)
 
 
-def read_core_trt_smrs(dstore):
-    """
-    :param dstore: a DataStore instance, possibly closed
-    :returns: a list of trt_smrs tuples, one per realization set, i.e.
-        len(dstore['core_trt_smrs']) tuples, less than the core size Gt
-    """
-    with dstore:  # NB: the datastore is closed when passed to a task
-        return [tuple(t) for t in dstore['core_trt_smrs'][:]]
-
-
 def build_csm(oq, full_lt, smdict, dstore):
     """
     :param oq: OqParam instance
@@ -692,8 +682,10 @@ def add_checksums(srcs):
     Build and attach a checksum to each source
     """
     for src in srcs:
+        # width_of_mfd_bin is set by modify_set_recurrow
         dic = {k: v for k, v in vars(src).items()
-               if k not in 'source_id ts_samples branch'}
+               if k not in {'source_id', 'ts_samples', 'branch',
+                            'width_of_mfd_bin'}}
         src.checksum = zlib.adler32(pickle.dumps(dic, protocol=4))
 
 

@@ -21,13 +21,15 @@ import unittest
 import numpy
 from openquake.baselib import general, config
 from openquake.baselib.general import decode
-from openquake.hazardlib import contexts, source_group, InvalidFile
+from openquake.hazardlib import source_group, InvalidFile, rmap_maker
 from openquake.hazardlib.calc.mean_rates import (
     to_rates, to_probs)
 from openquake.commonlib import readinput
 from openquake.calculators.views import view, text_table
 from openquake.calculators.export import export
 from openquake.calculators.extract import extract
+from openquake.calculators.classical import read_gid_dic, read_full_lt
+from openquake.hazardlib.rmap_maker import read_core_trt_smrs
 from openquake.calculators.tests import CalculatorTestCase, strip_calc_id
 from openquake.qa_tests_data.logictree import (
     case_01, case_02, case_03, case_04, case_05, case_06, case_07, case_08,
@@ -339,6 +341,22 @@ hazard_uhs-std.csv
         self.assertEqualFiles('expected/realizations_bis.csv', fname)
         [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_curve-mean_bis.csv', fname)
+
+    def test_gids_numbering(self):
+        # the gids of the cmakers must be numbered as the core list, the
+        # one used by read_gid_dic in the master, otherwise the rates are
+        # attributed to the wrong RateMap columns (this happened in ARB)
+        self.run_calc(case_18.__file__, 'job_bis.ini')
+        ds = self.calc.datastore
+        core = read_core_trt_smrs(ds)
+        full_lt = read_full_lt(ds)
+        gid_dic = read_gid_dic(ds, full_lt)
+        cmakers = rmap_maker.get_cmakers(
+            ds['trt_smrs'][:], full_lt, ds['oqparam'], core)
+        for cm in cmakers:
+            # the first set of realizations of the group, see _core_gids
+            ts = [t for t in core if set(t) <= set(cm.trt_smrs)][0]
+            numpy.testing.assert_equal(cm.gsim_idx, gid_dic[ts][0])
 
     def test_case_19(self):
         # test for nontrivial GMPE logictree and AvgGMPE
@@ -822,7 +840,7 @@ hazard_uhs-std.csv
         [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hcurves.csv', fname)
 
-        cmakers = contexts.read_cmakers(self.calc.datastore)
+        cmakers = rmap_maker.read_cmakers(self.calc.datastore)
         ae(list(cmakers[0].gsims.values()), [[1, 2, 3, 4], [0, 5], []])
         ae(list(cmakers[1].gsims.values()), [[6], [9], [7, 8]])
 
