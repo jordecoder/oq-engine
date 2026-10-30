@@ -45,6 +45,22 @@ def zero_dmgcsq(A, R, L, crmodel):
     return numpy.zeros((P, A, R, L, Dc), F32)
 
 
+def _compose_damage_counts(dd5, numbers, D):
+    # Compose per-peril probabilities and convert back to building counts.
+    dd4 = numpy.zeros(dd5.shape[1:])
+    A, E, L, _Dc = dd4.shape
+    for a in range(A):
+        if numbers[a] == 0:
+            continue
+        for e in range(E):
+            for li in range(L):
+                fractions = dd5[:, a, e, li, :D] / numbers[a]
+                dd4[a, e, li, :D] = (
+                    scientific.compose_dds(fractions) * numbers[a])
+    dd4[..., D:] = dd5[..., D:].max(axis=0)
+    return dd4
+
+
 def damage_from_gmfs(df, assetcol, oq, rlzs, monitor):
     """
     :param df: a DataFrame of GMFs
@@ -69,14 +85,12 @@ def damage_from_gmfs(df, assetcol, oq, rlzs, monitor):
         if len(gmf_df) == 0:
             continue
         eids = gmf_df.eid.to_numpy()
-        E = len(eids)
         if not oq.float_dmg_dist:
             rng = scientific.MultiEventRNG(
                 oq.master_seed, numpy.unique(eids))
         else:
             rng = None
         for taxo, adf in asset_df.groupby('taxonomy'):
-            A = len(adf)
             ords = adf.ordinal.to_numpy()
             idxs = [idx[o] for o in ords]
             rc = scientific.RiskComputer(crmodel, taxo)
@@ -87,13 +101,8 @@ def damage_from_gmfs(df, assetcol, oq, rlzs, monitor):
                 for e, rlz in enumerate(rlzs[eids]):
                     dmgcsq[:, idxs, rlz] += dd5[:, :, e]
             if P > 1:
-                dd4 = numpy.empty(dd5.shape[1:])
-                for li in range(L):
-                    for a in range(A):
-                        for e in range(E):
-                            dd4[a, e, li, :D] = scientific.compose_dds(
-                                dd5[:, a, e, li, :D])
-                            dd4[a, e, li, D:] = dd5[:, a, e, li, D:].max(axis=0)
+                dd4 = _compose_damage_counts(
+                    dd5, adf['value-number'].to_numpy(), D)
             else:
                 dd4 = dd5[0]
             tot = dd4.sum(axis=0)  # (E, L, Dc)
@@ -118,6 +127,24 @@ def _dframe(dd_dic, csqidx, loss_types):
                 dic[cname].append(dd[li, ci])
     fix_dtypes(dic)
     return pandas.DataFrame(dic)
+
+
+def fix_totals(child_df):
+    """
+    Set the total rows (the ones with the maximum agg_id) to the sums of
+    the asset rows with the same event_id and loss_id; child_df is
+    modified in place
+    """
+    total_agg_id = child_df.agg_id.max()
+    asset_mask = (child_df.agg_id != total_agg_id).to_numpy()
+    total_mask = (child_df.agg_id == total_agg_id).to_numpy()
+    keys = pandas.MultiIndex.from_arrays(
+        [child_df.index[total_mask], child_df.loss_id[total_mask]])
+    for col in ['non_operational_inter', 'non_operational']:
+        sums = child_df[asset_mask].groupby(
+            ['event_id', 'loss_id'])[col].sum()
+        child_df.loc[total_mask, col] = sums.reindex(
+            keys, fill_value=0).to_numpy()
 
 
 @base.calculators.add('event_based_damage', 'scenario_damage')
@@ -163,27 +190,30 @@ class DamageCalculator(EventBasedRiskCalculator):
             rlzs = self.datastore['events']['rlz_id']
         else:
             rlzs = None
-        self.datastore.swmr_on()
-        smap =  parallel.Starmap(damage_from_gmfs, h5=self.datastore)
-        smap.monitor.save('aggids', aggids)
-        smap.monitor.save('crmodel', self.crmodel)
         ct = oq.concurrent_tasks or 1
         sids = self.assetcol['site_id']
-        for t in range(ct):
-            gmf_tile = gmf_df[gmf_df.sid % ct == t]
-            asset_tile = self.assetcol.new(self.assetcol.array[sids % ct == t])
-            if len(asset_tile):
-                smap.submit((gmf_tile, asset_tile, oq, rlzs))
-        csqidx = {dc: i + 1 for i, dc in enumerate(self.crmodel.get_dmg_csq())}
         dd_dict = general.AccumDict(accum=0)
-        for ddd, dmgcsq, ords in smap:
-            dd_dict += ddd
-            self.dmgcsq[:, ords] += dmgcsq
+        with self.datastore.reopen('r'):  # read-only in the parallel phase
+            smap =  parallel.Starmap(damage_from_gmfs, h5=self.datastore,
+                                     perf='memory')
+            smap.monitor.save('aggids', aggids)
+            smap.monitor.save('crmodel', self.crmodel)
+            for t in range(ct):
+                gmf_tile = gmf_df[gmf_df.sid % ct == t]
+                asset_tile = self.assetcol.new(
+                    self.assetcol.array[sids % ct == t])
+                if len(asset_tile):
+                    smap.submit((gmf_tile, asset_tile, oq, rlzs))
+            for ddd, dmgcsq, ords in smap:
+                dd_dict += ddd
+                self.dmgcsq[:, ords] += dmgcsq
+        csqidx = {dc: i + 1 for i, dc in enumerate(self.crmodel.get_dmg_csq())}
         df = _dframe(dd_dict, csqidx, oq.loss_types)
         with self.monitor('saving risk_by_event', measuremem=True):
-            for name in df.columns:
-                dset = self.datastore['risk_by_event/' + name]
-                hdf5.extend(dset, df[name].to_numpy())
+            with self.datastore.reopen('a'):
+                for name in df.columns:
+                    dset = self.datastore['risk_by_event/' + name]
+                    hdf5.extend(dset, df[name].to_numpy())
         return 1
 
     def post_execute(self, dummy):
@@ -247,7 +277,7 @@ class DamageCalculator(EventBasedRiskCalculator):
                     self.dmgcsq[p, :, r, li, 0] = number - ndamaged[:, li]
         # due numeric errors we can have small negative damages; we fix them
         small = self.dmgcsq < 0
-        assert (small > -1E-6).all()
+        assert (self.dmgcsq[small] > -1E-6).all()
         self.dmgcsq[small] = 0
 
     def _store_damages(self):
@@ -308,7 +338,9 @@ class DamageCalculator(EventBasedRiskCalculator):
 
         for i, row in self.interdep_df.iterrows():
             # Find events where the source assets in in the
-            # triggering damage/functionality state
+            # triggering damage/functionality state; the states are 0 or 1
+            # only with discrete_damage_distribution = true, which is
+            # required for the interdependencies analysis
             source_mask = (
                 (parent_df.agg_id == row.parent_id) &
                 (parent_df[row.col] == 1)
@@ -326,29 +358,8 @@ class DamageCalculator(EventBasedRiskCalculator):
             child_df['non_operational_orig'].to_numpy(),
             child_df['non_operational_inter'].to_numpy())
 
-        # Correct the total values per event
-        total_agg_id = child_df.agg_id.max()
-        asset_mask = child_df.agg_id != total_agg_id
-        total_mask = child_df.agg_id == total_agg_id
-
-        inter_totals = (
-            child_df.loc[asset_mask]
-            .groupby(level='event_id')['non_operational_inter']
-            .sum()
-        )
-        nonop_totals = (
-            child_df.loc[asset_mask]
-            .groupby(level='event_id')['non_operational']
-            .sum()
-        )
-
-        child_df.loc[total_mask, 'non_operational_inter'] = (
-            child_df.loc[total_mask].index.map(inter_totals)
-        )
-
-        child_df.loc[total_mask, 'non_operational'] = (
-            child_df.loc[total_mask].index.map(nonop_totals)
-        )
+        # Correct the total values per event and loss type
+        fix_totals(child_df)
 
         # Storing new columns in the dstore
         self.datastore['risk_by_event/non_operational'][:] = (

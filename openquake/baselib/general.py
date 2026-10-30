@@ -19,6 +19,7 @@
 """
 Utility functions of general interest.
 """
+import gc
 import os
 import sys
 import zlib
@@ -48,6 +49,39 @@ import numpy
 import pandas
 from decorator import decorator
 from openquake.baselib import __version__, config
+
+
+@contextmanager
+def gc_disabled():
+    """
+    Disable the garbage collector inside the context (if it was enabled):
+    when creating or receiving millions of objects (like the sources of a
+    big model) the collector would traverse them many times, wasting a lot
+    of time without freeing anything
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def humanize_number(value, precision=2):
+    """Format a number compactly, e.g. 1000 as ``1.00K``."""
+    try:
+        value = float(value)
+    except (ValueError, TypeError):
+        return str(value)
+    if value < 1000:
+        return f'{value:.{precision}f}'
+    if value < 1000000:
+        return f'{value / 1000:.{precision}f}K'
+    if value < 1000000000:
+        return f'{value / 1000000:.{precision}f}M'
+    return f'{value / 1000000000:.{precision}f}B'
+
 
 U8 = numpy.uint8
 U16 = numpy.uint16

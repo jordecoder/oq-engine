@@ -29,9 +29,9 @@ from openquake.calculators.country_impact_report_builder import (
 from openquake.calculators.extract import extract
 from openquake.calculators.country_impact_report_utils import (
     EventContext, ReportOptions, LOSS_METADATA, get_configured_path,
-    points_to_gdf)
+    get_fatalities_loss_type, points_to_gdf)
 from openquake.commonlib import logs, datastore
-from openquake.commonlib.readinput import get_close_countries
+from openquake.commonlib.readinput import get_close_countries, get_rupture
 
 cd = pathlib.Path(__file__).parent
 
@@ -44,10 +44,11 @@ DISCLAIMER_TXT = '''
     subject to changes as more information becomes available.'''
 
 
-def _get_impact_summary_data(dstore, iso3, no_uncertainty):
+def _get_impact_summary_data(dstore, iso3, no_uncertainty, occ_lt):
+    # occ_lt is the loss type of the fatalities for the selected time event
     aggrisk_tags = extract(dstore, 'aggrisk_tags')
     mapping = {
-        meta["label"]: loss_type
+        meta["label"]: occ_lt if loss_type == 'occupants' else loss_type
         for loss_type, meta in LOSS_METADATA.items()
     }
     rows = aggrisk_tags.loc[
@@ -72,20 +73,19 @@ def _get_impact_summary_data(dstore, iso3, no_uncertainty):
         matching_rows = rows.loc[rows['loss_type'] == lt]
         if not matching_rows.empty:
             r = matching_rows.iloc[0]
-            q50 = int(round(r.get('q50', 0)))
-            q05 = int(round(r.get('q05', 0)))
-            q95 = int(round(r.get('q95', 0)))
-            exposed_val = int(round(r.get('value', 0)))
+            q50 = float(r.get('q50', 0))
+            q05 = float(r.get('q05', 0))
+            q95 = float(r.get('q95', 0))
+            exposed_val = float(r.get('value', 0))
         else:
-            q50 = q05 = q95 = exposed_val = 0
-        # Format with thousands separators
+            q50 = q05 = q95 = exposed_val = 0.0
         if no_uncertainty:
             # Display only the central value
-            summary_data[label] = f"{q50:,}"
+            summary_data[label] = str(q50)
         else:
             # Display the range
-            summary_data[label] = f"{q05:,} - {q95:,}"
-        summary_data[f"{label}_exposed"] = f"{exposed_val:,}"
+            summary_data[label] = f"{q05} - {q95}"
+        summary_data[f"{label}_exposed"] = str(exposed_val)
     return summary_data
 
 
@@ -188,6 +188,19 @@ def _get_shakemap_version(rupdic):
         return None
 
 
+def _get_rupture(oqparam):
+    # Return the rupture if a rupture model was given, otherwise None,
+    # so that the epicenter will be displayed in the maps as a fallback
+    if 'rupture_model' not in oqparam.inputs:
+        return None
+    try:
+        return get_rupture(oqparam)
+    except Exception:
+        logging.warning('Could not read the rupture model; the maps will'
+                        ' display the epicenter instead', exc_info=True)
+        return None
+
+
 def _get_threshold_deg(threshold_deg, mag):
     if threshold_deg is None:
         threshold_deg = get_dynamic_threshold(mag)
@@ -209,6 +222,9 @@ def _build_report_contexts(dstore, oqparam, calc_id, threshold_deg):
 
     avg_losses = extract(dstore, 'avg_losses?kind=stats')
     losses_df, loss_metric = _get_losses_df(avg_losses)
+    # the maps display the fatalities for the selected time event
+    losses_df = losses_df.rename(
+        columns={get_fatalities_loss_type(oqparam): 'occupants'})
 
     rupdic = oqparam.rupture_dict
     event_name = _get_event_name(rupdic)
@@ -229,7 +245,7 @@ def _build_report_contexts(dstore, oqparam, calc_id, threshold_deg):
 
     event_ctx = EventContext(
         name=event_name, date=event_date, hypocenter=(lon, lat),
-        shakemap_version=shakemap_version)
+        shakemap_version=shakemap_version, rupture=_get_rupture(oqparam))
     report_opts = ReportOptions(
         disclaimer_txt=DISCLAIMER_TXT,
         basemap_path=_get_basemap_path(), threshold_deg=threshold_deg,
@@ -283,10 +299,11 @@ def _generate_reports(dstore, adm_level, threshold_deg, calc_id):
 
     points_gdf = None
     failed_countries = []
+    occ_lt = get_fatalities_loss_type(oqparam)
     for iso3 in iso3_codes:
         try:
             summary_data = _get_impact_summary_data(
-                dstore, iso3, report_opts.no_uncertainty)
+                dstore, iso3, report_opts.no_uncertainty, occ_lt)
             if summary_data is not None:
                 if points_gdf is None:
                     points_gdf = points_to_gdf(

@@ -24,7 +24,8 @@ from unittest import mock
 
 from openquake.baselib import parallel, general, config, hdf5, performance
 from openquake.baselib.general import decode, gettemp
-from openquake.hazardlib import InvalidFile, nrml, calc, rmap_maker
+from openquake.hazardlib import (
+    InvalidFile, nrml, calc, rmap_maker, source_reader)
 from openquake.hazardlib.source.rupture import get_ruptures_aw
 from openquake.hazardlib.source_group import read_src_group
 from openquake.hazardlib.sourcewriter import write_source_model
@@ -32,7 +33,7 @@ from openquake.calculators.classical import ClassicalCalculator
 from openquake.calculators.views import view, text_table
 from openquake.calculators.export import export
 from openquake.calculators.extract import extract
-from openquake.calculators.tests import CalculatorTestCase
+from openquake.calculators.tests import CalculatorTestCase, no_fastmean
 from openquake.qa_tests_data.classical import (
     case_01, case_02, case_03, case_04, case_05, case_06, case_07, case_08,
     case_09, case_10, case_11, case_12, case_13, case_18, case_22, case_23,
@@ -44,7 +45,7 @@ from openquake.qa_tests_data.classical import (
     case_69, case_70, case_71, case_72, case_74, case_75, case_76, case_77,
     case_78, case_80, case_81, case_82, case_83, case_84, case_85, case_86,
     case_87, case_88, case_89, case_90, case_91, case_92, case_93, case_94,
-    case_95, case_96)
+    case_95, case_96, case_97, case_98)
 
 ae = numpy.testing.assert_equal
 aac = numpy.testing.assert_allclose
@@ -104,6 +105,20 @@ class ClassicalTestCase(CalculatorTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.run_calc(case_01.__file__, 'job.ini', minimum_magnitude='4.5')
         self.assertIn('All sources were discarded', str(ctx.exception))
+
+    def test_case_01_quantile_maps_without_mean(self):
+        # Exercise the few-sites path, including the hazard-map checks.
+        self.run_calc(case_01.__file__, 'job.ini',
+                      mean_hazard_curves='false', quantile_hazard_curves='0.5',
+                      poes='0.01', max_sites_disagg='10')
+        self.assertEqual(list(self.calc.oqparam.hazard_stats()),
+                         ['quantile-0.5'])
+        ds = self.calc.datastore
+        # With one realization, its curves/maps equal the median outputs.
+        for kind in ('hcurves', 'hmaps'):
+            quantiles = ds.sel(kind + '-stats', stat='quantile-0.5')
+            ae(quantiles, ds[kind + '-rlzs'][:])
+            self.assertGreater(quantiles.max(), 0)
 
     def test_case_02(self):
         # test for Lanzano2019 with vs30 > 1500
@@ -189,6 +204,19 @@ class ClassicalTestCase(CalculatorTestCase):
         aac(hcurve1, pga1, rtol=3e-6)
         aac(hcurve2, pga2, rtol=3e-6)
 
+    def test_case_06_disagg_by_src(self):
+        # a single site with label Cascadia, affected by both TRTs;
+        # the mean_rates_by_src must be computed with the gsim weights
+        # of the label ([.1, .9, 0] for Active Shallow Crust) and not with
+        # the default ones ([.5, .5, 0]), otherwise they are 36% off
+        self.run_calc(case_06.__file__, 'job_dbs.ini')
+        dstore = self.calc.datastore
+        ae(self.calc.sitecol.ilabel, [1])
+        itime = self.calc.oqparam.investigation_time
+        got = dstore['mean_rates_by_src/array'][0].sum(axis=2)  # (M, L1)
+        exp = calc.disagg.to_rates(dstore['hcurves-stats'][0, 0]) / itime
+        aac(got, exp, atol=1e-6, rtol=1e-4)
+
     def test_case_06_sampling(self):
         # testing oversampling
         self.run_calc(case_06.__file__, 'job.ini',
@@ -269,7 +297,8 @@ class ClassicalTestCase(CalculatorTestCase):
         hcurves1 = self.calc.datastore['hcurves-stats'][:]
         self.run_calc(case_10.__file__, 'job_refrates.ini')
         hcurves2 = self.calc.datastore['hcurves-stats'][:]
-        aac(hcurves1, hcurves2)
+        # the sums over the tasks can differ in the last digits
+        aac(hcurves1, hcurves2, rtol=1e-6)
 
     def test_case_11(self):
         # Check grid-adjusted GMPE
@@ -345,7 +374,7 @@ class ClassicalTestCase(CalculatorTestCase):
         ], case_22.__file__, delta=1E-6)
 
         data = self.calc.datastore['source_groups']
-        self.assertEqual(data['tiles'], [1])
+        self.assertEqual(data['tiles'], [10])
         self.assertEqual(data['blocks'], [2])
 
     def test_case_23(self):  # filtering away on TRT
@@ -383,7 +412,9 @@ class ClassicalTestCase(CalculatorTestCase):
         # make sure probs_occur are stored as expected
         probs_occur = self.calc.datastore['rup/probs_occur'][:]
         tot_probs_occur = sum(len(po) for po in probs_occur)
-        self.assertEqual(tot_probs_occur, 4)  # 2 x 2
+        # 2 atomic groups x 2 ruptures x 2 probabilities; there were 4
+        # when the ruptures of the second atomic group were not stored
+        self.assertEqual(tot_probs_occur, 8)
 
         # check mean_rates_by_src
         [fname] = export(('mean_rates_by_src', 'csv'), self.calc.datastore)
@@ -405,6 +436,31 @@ class ClassicalTestCase(CalculatorTestCase):
         rel = view('relevant_sources:PGV', self.calc.datastore)
         fname = general.gettemp(text_table(rel, ext='org'))
         self.assertEqualFiles('expected/rel_source.org', fname)
+
+    def test_case_27_other(self):
+        # the second atomic group has sources named other:03, other:04;
+        # with disagg_by_src the rates of each atomic group must be
+        # attributed to its own source, while they were all attributed to
+        # the first group of the task, i.e. case=0 and other=9.39E-3
+        self.run_calc(case_27.__file__, 'job_other.ini')
+        mrs = self.calc.datastore['mean_rates_by_src']
+        rates = dict(zip(mrs.src_id, mrs.array[0, 0, 0]))  # site 0, PGV
+        aac([rates['case'], rates['other']], [5.1798E-3, 4.2115E-3],
+            rtol=1E-4)
+        # the total is the same as in case_27, where both groups are 'case'
+        aac(rates['case'] + rates['other'], 9.3913E-3, rtol=1E-4)
+        # the ruptures of both atomic groups are stored, see test_case_27
+        probs_occur = self.calc.datastore['rup/probs_occur'][:]
+        self.assertEqual(sum(len(po) for po in probs_occur), 8)
+
+    def test_case_27_labels(self):
+        # two close sites with different labels and the same gsim: the
+        # atomic groups must be computed for both, while they were
+        # computed only for the last label (0.0049 instead of 0.378)
+        self.run_calc(case_27.__file__, 'job_labels.ini')
+        ae(self.calc.sitecol.ilabel, [0, 1])
+        hc = self.calc.datastore['hcurves-stats'][:, 0, 0, 0]  # PGV
+        aac(hc, [0.3777862, 0.3783247], rtol=1e-5)
 
     def test_case_28(self):
         # Simple fault with hypoDepthDist
@@ -506,6 +562,7 @@ class ClassicalTestCase(CalculatorTestCase):
     
     def test_case_36(self):
         # Test mag-dependent aratio using the linear_piecewise expression type
+        # The compact area source keeps rupture generation fast.
         self.assert_curves_ok(["hazard_curve-mean-PGA.csv"], case_36.__file__)
 
         # Check that epistemic uncertainty on aratio is rejected when the
@@ -588,6 +645,22 @@ class ClassicalTestCase(CalculatorTestCase):
                       "(SA) for the GSIM [SiMidorikawa1999Asc]",
                       str(ctx.exception))
 
+    def test_case_39_disagg_by_src(self):
+        # Source contributions must use the weights of each IMT, including
+        # GSIMs with zero default weight and nonzero weight for one IMT.
+        for site_model in ('site_model.csv', 'sites_dbs.csv'):
+            with self.subTest(site_model=site_model):
+                self.run_calc(
+                    case_39.__file__, 'job.ini', disagg_by_src='true',
+                    site_model_file=site_model, investigation_time='2')
+                ds = self.calc.datastore
+                got = ds['mean_rates_by_src/array'][:].sum(axis=3)
+                itime = self.calc.oqparam.investigation_time
+                exp = calc.disagg.to_rates(
+                    ds['hcurves-stats'][:, 0]) / itime
+                aac(got, exp, atol=1E-7, rtol=1E-4)
+                self.assertGreater(got[:, 0].max(), 0)
+
     def test_case_40(self):
         # NGA East
         self.assert_curves_ok([
@@ -615,10 +688,13 @@ class ClassicalTestCase(CalculatorTestCase):
         self.assertEqual(list(df.columns), ['stat', 'imt', 'poe', 'value'])
 
     def test_case_43(self):
-        # this is a test for pointsource_distance and ps_grid_spacing
+        # this is a test for pointsource_distance and ps_grid_spacing=auto
         # it also checks running a classical after a preclassical
         self.run_calc(case_43.__file__, 'job.ini',
                       calculation_mode='preclassical', concurrent_tasks='4')
+        oq = self.calc.datastore['oqparam']
+        self.assertEqual(oq.ps_grid_spacing, 50.)
+        self.assertEqual(oq.pointsource_distance['default'], 15.)
         hc_id = str(self.calc.datastore.calc_id)
         self.run_calc(case_43.__file__, 'job.ini',
                       hazard_calculation_id=hc_id, concurrent_tasks='4')
@@ -647,6 +723,13 @@ class ClassicalTestCase(CalculatorTestCase):
         # Test use of setLowerSeismDepthAbsolute on area, mps and point sources
         self.assert_curves_ok(['hazard_curve-mean-PGA.csv'],
                               case_45.__file__)
+
+    def test_strided_reading(self):
+        # reading the source models with strides (see source_reader.BIG_FILE)
+        # gives the same results, also with mutex groups and uncertainties
+        with mock.patch.object(source_reader, 'BIG_FILE', 0):
+            self.test_case_27()
+            self.test_case_45()
         
     def test_case_47(self):
         # Mixture Model for Sigma using PEER (2018) Test Case 2.5b
@@ -1043,6 +1126,22 @@ class ClassicalTestCase(CalculatorTestCase):
         fname = general.gettemp(text_table(dbm, ext='org'))
         self.assertEqualFiles('expected/disagg_by_dist.org', fname)
 
+    def test_case_78_mfd_variants(self):
+        # Negative-binomial MFD variants need their own occurrence PMFs.
+        # In a previous refactoring the fast path reused them, giving the
+        # same curves for the two realizations.
+        kw = dict(source_model_logic_tree_file='source_logic_tree_mfd.xml',
+                  ps_grid_spacing='0', individual_rlzs='true', poes='')
+        self.run_calc(case_78.__file__, 'job.ini', **kw)
+        curves = self.calc.datastore['hcurves-rlzs'][:]
+        # Compute each variant separately as a reference for the fast path.
+        with mock.patch('openquake.calculators.classical._make_results',
+                        return_value=None):
+            self.run_calc(case_78.__file__, 'job.ini', **kw)
+        reference = self.calc.datastore['hcurves-rlzs'][:]
+        aac(curves, reference, rtol=1E-5)
+        self.assertFalse(numpy.allclose(curves[:, 0], curves[:, 1]))
+
     def test_case_80(self):
         # New Madrid cluster with rup_mutex
         self.run_calc(case_80.__file__, 'job.ini')
@@ -1068,6 +1167,7 @@ class ClassicalTestCase(CalculatorTestCase):
 
     def test_case_82(self):
         # two mps, only one should be collapsed and use reqv
+        # The fixtures keep eight near-site points each to limit runtime.
         self.run_calc(case_82.__file__, 'job.ini')
         [f1] = export(('mean_rates_by_src', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/mean_rates_by_src.csv', f1)
@@ -1079,9 +1179,11 @@ class ClassicalTestCase(CalculatorTestCase):
         self.assertEqualFiles('expected/hazard_curve-mean.csv', f1)
 
     def test_case_84(self):
-        # three sources are identical except for their source_ids.
-        # one is collapsed using reqv, while the other two are specified
-        # as 'not collapsed' in the job file field reqv_ignore_sources
+        # three sources are identical except for their source_ids and a
+        # small shift in latitude (otherwise check_same_sources would
+        # complain); one is collapsed using reqv, while the other two are
+        # specified as 'not collapsed' in the job file field
+        # reqv_ignore_sources
         self.run_calc(case_84.__file__, 'job.ini')
         [f] = export(('mean_rates_by_src', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/rbs.csv', f)
@@ -1241,6 +1343,77 @@ class ClassicalTestCase(CalculatorTestCase):
         [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_curve-mean-PGA.csv', fname)
 
+    def test_case_97(self):
+        # the logic tree has IMT-dependent weights for PGA and SA(1.0),
+        # i.e. IMTs which are not a prefix of the IMTs of the calculation
+        # (PGA, SA(0.2), SA(1.0)); the weights of each IMT must be taken
+        # from the right column of the logic tree
+        self.run_calc(case_97.__file__, 'job.ini')
+        fast = self.calc.datastore['hcurves-stats'][:, 0]
+
+        # the test is meaningful only if the weights of the logic tree are
+        # IMT-dependent and are not aligned with the IMTs of the calculation
+        full_lt = self.calc.datastore['full_lt'].init()
+        self.assertEqual(full_lt.gsim_lt.wget.imti,
+                         {'PGA': 0, 'SA(1.0)': 1, 'weight': 2})
+        self.assertEqual(list(self.calc.oqparam.imtls),
+                         ['PGA', 'SA(0.2)', 'SA(1.0)'])
+
+        # the fastmean algorithm and the standard algorithm must agree
+        with no_fastmean():
+            self.run_calc(case_97.__file__, 'job.ini')
+        slow = self.calc.datastore['hcurves-stats'][:, 0]
+        aac(fast, slow, rtol=1E-6)
+
+    def test_97_fastmean_view(self):
+        # the fastmean view must return the mean hazard curve of the site
+        self.run_calc(case_97.__file__, 'job.ini')
+        ds = self.calc.datastore
+        arr = view('fastmean:0', ds)
+        mean = ds['hcurves-stats'][0, 0]  # the first stat is the mean
+        for m, imt in enumerate(ds['oqparam'].imtls):
+            aac(arr[imt], mean[m], rtol=1E-5)
+
+    def test_97_mcurves(self):
+        # calc_mcurves must use the IMT-dependent weights, like the
+        # standard algorithm does
+        self.run_calc(case_97.__file__, 'job.ini')
+        oq = self.calc.oqparam
+        oq.use_rates = True
+        hcurves, _ = calc.mean_rates.calc_mcurves(
+            self.calc.csm.src_groups, self.calc.sitecol,
+            self.calc.full_lt, oq)
+        mean = self.calc.datastore['hcurves-stats'][0, 0]
+        aac(hcurves[0], mean, rtol=6E-5)
+
+    def test_case_98(self):
+        # Convert BSSA14 GMM to other horz comps (natively its RotD50)
+
+        # target == native: no conversion applied, output stays in RotD50
+        self.assert_curves_ok(
+            ['hazard_curve-convert-to-rotd50-PGA.csv',
+             'hazard_curve-convert-to-rotd50-SA(1.0).csv'],
+            case_98.__file__, horiz_comp_to='rotd50')
+
+        # RotD50 -> GEOM using the BK17 Table 2 RotD50/GMAR ratio
+        self.assert_curves_ok(
+            ['hazard_curve-convert-to-geometric_mean-PGA.csv',
+             'hazard_curve-convert-to-geometric_mean-SA(1.0).csv'],
+            case_98.__file__, horiz_comp_to='geometric_mean')
+
+        # RotD50 -> Larger via the BK17 Larger/RotD50 ratio
+        self.assert_curves_ok(
+            ['hazard_curve-convert-to-greater_of_two_horizontal-PGA.csv',
+             'hazard_curve-convert-to-greater_of_two_horizontal-SA(1.0).csv'],
+            case_98.__file__,
+            horiz_comp_to='greater_of_two_horizontal')
+
+        # RotD50 -> RotD100 via the direct BK17 RotD100/RotD50 ratio
+        self.assert_curves_ok(
+            ['hazard_curve-convert-to-rotd100-PGA.csv',
+             'hazard_curve-convert-to-rotd100-SA(1.0).csv'],
+            case_98.__file__, horiz_comp_to='rotd100')
+
 
 class FakeDatastoreCalculator:
     """
@@ -1248,6 +1421,7 @@ class FakeDatastoreCalculator:
     ClassicalCalculator.post_execute
     """
     SLOW_TASK_ERROR = True
+    MIN_EFFICIENCY = ClassicalCalculator.MIN_EFFICIENCY
 
     def __init__(self, h5):
         self.datastore = mock.MagicMock(calc_id=1)
@@ -1260,42 +1434,41 @@ class SlowTasksTestCase(unittest.TestCase):
     """
     Check the detection of slow tasks in ClassicalCalculator.post_execute.
     The Starmap can generate subtasks with a different name (classical ->
-    baseclassical) when the tasks are too slow, and the rows must be
-    combined and not compared, since they are components of the busy time
-    of the same workers. NB: this cannot be tested by running a
-    calculation, since starmap_info is written only if there is more than
-    one core, and with OQ_DISTRIBUTE=no there is a single core.
+    baseclassical) when the tasks are too slow, and each row of the
+    starmap_info holds the efficiency (total_time / num_cores / max_time)
+    and the max_time of the busy times of the workers. NB: this cannot be
+    tested by running a calculation, since starmap_info is written only if
+    there is more than one core, and with OQ_DISTRIBUTE=no there is a
+    single core.
     """
-    # each case is a list of (taskname, mean, std, min, max) rows in the
+    # each case is a list of (taskname, efficiency, maxtime) rows in the
     # starmap_info, followed by the expected outcome
     CASES = [
         # no info at all
         ([], False),
         # a single row, as in a classical calculation without splitting
-        ([('classical', 10., 1., 9., 11.)], False),
-        ([('classical', 10., 4., 4., 16.)], True),
+        ([('classical', .9, 20.)], False),
+        ([('classical', .4, 20.)], True),
+        # the threshold is inclusive: an efficiency equal to MIN_EFFICIENCY
+        # is acceptable
+        ([('classical', .7, 20.)], False),
+        ([('classical', .69, 20.)], True),
+        # a split Starmap has a single classical row, since the busy times
+        # of the baseclassical subtasks are summed to the classical ones
+        ([('classical', .5, 20.)], True),
         # tasks so fast that the busy times are dominated by the startup
-        # of the workers: the ratio 1.5 is meaningless (see eshm20)
-        ([('classical', .15, .225, .1, .4)], False),
-        # a split Starmap: the classical tasks only decide to split, so
-        # they are fast and must be discarded, while the baseclassical
-        # ones do the actual work
-        ([('classical', .05, .001, .05, .05),
-          ('baseclassical', 12., 3., 9., 15.)], False),
-        ([('classical', .05, .001, .05, .05),
-          ('baseclassical', 12., 9., 3., 21.)], True),
-        # a fast but noisy row must not trigger the alarm, since the rows
-        # are combined: sqrt(3**2 + .6**2) / 31.5 = 0.097
-        ([('classical', 30., 3., 27., 33.),
-          ('baseclassical', 1.5, .6, .9, 2.1)], False),
-        # combining two equally noisy rows divides the relative spread
-        # by sqrt(2), so a spread of .4 per row is not enough
-        ([('classical', 10., 4., 4., 16.),
-          ('baseclassical', 10., 4., 4., 16.)], False),
-        ([('classical', 10., 5., 5., 15.),
-          ('baseclassical', 10., 5., 5., 15.)], True),
+        # of the workers: the efficiency is meaningless (see eshm20)
+        ([('classical', .24, .7)], False),
+        # the time threshold is inclusive
+        ([('classical', .5, 4.)], True),
+        # below the time threshold the check is skipped (see eshm20)
+        ([('classical', .5, 3.9)], False),
+        # alaska has a busy time of about 4.8 seconds and must be checked
+        ([('classical', .5, 4.8)], True),
+        # a stray baseclassical row is not considered
+        ([('baseclassical', .5, 20.)], False),
         # a calculation with no classical Starmap has no slow tasks
-        ([('postclassical', 12., 9., 3., 21.)], False),
+        ([('postclassical', .3, 20.)], False),
     ]
 
     def check(self, rows):

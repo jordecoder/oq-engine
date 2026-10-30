@@ -35,7 +35,7 @@ from openquake.hazardlib.calc.filters import (
     getdefault, split_source, SourceFilter)
 from openquake.hazardlib.scalerel.point import PointMSR
 from openquake.commonlib import readinput
-from openquake.calculators import base
+from openquake.calculators import base, autogrid
 
 MAX_NUM_RUPTURES = 52_000  # to support HimalayanThrust in CHN
 U16 = numpy.uint16
@@ -183,7 +183,9 @@ def preclassical(sources, sf, cmaker, secparams, num_tasks, monitor=None):
     if cmaker.ps_grid_spacing and cmaker.split_sources:
         srcs = []
         for src in sources:
-            if src.code in b'AM':
+            # NB: the sources modified by the uncertainties are not split
+            # here, see filter_weight; they are weighted there instead
+            if src.code in b'AM' and not src.bysrc_unc:
                 srcs.extend(split_source(src))
             else:
                 srcs.append(src)
@@ -326,6 +328,8 @@ class PreClassicalCalculator(base.HazardCalculator):
         sites = csm.sitecol if csm.sitecol else None
         if sites is None:
             logging.warning('No sites??')
+        elif oq.auto_grid:
+            self.calibrate_grid(sites)
 
         # the core size Gt, i.e. the number of columns of the global
         # RateMap, is known already at build time (see
@@ -380,6 +384,32 @@ class PreClassicalCalculator(base.HazardCalculator):
         self._process(atomic_sources, normal_sources, sf, secparams)
         allsources = csm.get_sources()
         self.store_source_info(source_data(allsources))
+
+    def calibrate_grid(self, sites):
+        """
+        Determine ps_grid_spacing and pointsource_distance on a sample
+        of sites, since the user set ps_grid_spacing=auto
+        """
+        oq = self.oqparam
+        cmakers = self.cmakers.to_array()
+        with self.monitor('calibrating ps_grid_spacing'):
+            best = autogrid.calibrate(
+                self.csm, cmakers, sites, oq, self.datastore.hdf5)
+        if best is None:  # no point sources
+            return
+        psgs, psd = best
+        logging.warning('Using ps_grid_spacing=%s, pointsource_distance=%s',
+                        psgs, psd)
+        oq.ps_grid_spacing = psgs
+        for cmaker in cmakers:
+            cmaker.ps_grid_spacing = psgs
+        if not oq.psd_given:  # keep the pointsource_distance of the user
+            oq.pointsource_distance = {'default': psd}
+            for cmaker in cmakers:
+                cmaker.pointsource_distance = psd
+        # store the calibrated parameters, used when starting from --hc
+        del self.datastore['oqparam']
+        self.datastore['oqparam'] = oq
 
     def _process(self, atomic_sources, normal_sources, sf, secparams):
         # run preclassical in parallel for non-atomic sources
@@ -437,7 +467,11 @@ class PreClassicalCalculator(base.HazardCalculator):
         """
         if not hasattr(self, 'csm'):  # used only for post_process
             return
-        self.populate_csm()
+        # the garbage collector is disabled while receiving, gridding and
+        # weighting the sources, since there can be millions of them: in
+        # Melbourne it was wasting ~50 seconds in the reduce
+        with general.gc_disabled():
+            self.populate_csm()
         return self.csm
 
     def post_execute(self, csm):
@@ -464,8 +498,9 @@ class PreClassicalCalculator(base.HazardCalculator):
             self.datastore.hdf5.save_vlen('delta_rates', deltas)
 
         # save 'source_groups'
-        self.max_weight = store_csm(
-            self.datastore, self.csm, self.sitecol, self.cmakers)
+        with general.gc_disabled():
+            self.max_weight = store_csm(
+                self.datastore, self.csm, self.sitecol, self.cmakers)
 
         # save gsims
         toml = []

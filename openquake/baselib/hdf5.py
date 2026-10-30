@@ -130,6 +130,16 @@ class FakeDataset:
         pass
 
 
+class FakeH5(dict):
+    """
+    Cache used when there is no datastore, with a null performance table
+    """
+    mode = 'w'
+
+    def __init__(self):
+        super().__init__(performance_data=FakeDataset())
+
+
 def extend(dset, array, **attrs):
     """
     Extend an extensible dataset with an array of a compatible dtype.
@@ -1126,6 +1136,18 @@ def save_npz(obj, path):
     with warnings.catch_warnings():
         warnings.filterwarnings("error", category=UserWarning)
         numpy.savez_compressed(path, **a)
+
+
+def is_unique(fname, dfname, *kfields):
+    """
+    :param fname: path to an HDF5 file
+    :param dfname: name of a DataFrame
+    :param kfields: key fields that could be unique
+    :returns: true if the kfields are a primary key (no duplicates)
+    """
+    assert kfields, "Specify at least one key field"
+    with File(fname, 'r') as f:
+        return f.read_df(dfname, kfields).index.is_unique
 
 # #################### obj <-> json ##################### #
 

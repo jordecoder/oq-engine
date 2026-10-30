@@ -186,6 +186,10 @@ class RmapMaker(object):
     def make(self):
         dic = {}
         self.rupdata = []
+        # NB: the cfactor of the cmaker is shared by the results of the
+        # task (see restrict_trt_smrs) and accumulated in the master, so
+        # only the increment of this result must be returned
+        cfactor0 = self.cmaker.cfactor.copy()
         self.source_data = AccumDict(accum=[])
         if not self.src_mutex and not self.rup_mutex:
             pnemap = self._make_src_indep()
@@ -207,7 +211,7 @@ class RmapMaker(object):
 
         dic['rmap'] = pnemap.to_rates()
         dic['rmap'].gid = self.cmaker.gid
-        dic['cfactor'] = self.cmaker.cfactor
+        dic['cfactor'] = self.cmaker.cfactor - cfactor0
         if self.oq.keep_rupdata:
             dic['rup_data'] = concat(self.rupdata)
         else:
@@ -293,6 +297,11 @@ def make_results(groups, cmakers, sites):
     (see _mag_ratios). Only independent Poisson sources are supported,
     since the probabilities are then linear in the rates.
     """
+    # Non-Poisson occurrence PMFs must be recomputed for each MFD variant;
+    # rescaling occurrence_rate while reusing probs_occur is incorrect.
+    if any(not isinstance(getattr(src, 'temporal_occurrence_model', None),
+                          PoissonTOM) for grp in groups for src in grp):
+        raise ValueError('non-Poisson sources')
     rates = [_rates_by_mag(grp) for grp in groups]
     b = max(range(len(groups)),
             key=lambda v: sum(len(d) for d in rates[v]))
@@ -309,10 +318,12 @@ def make_results(groups, cmakers, sites):
             'the variants have %s sources, expected %d: some sources were '
             'filtered away by the uncertainties' % (nsrcs, len(sources)))
     # ratios[v][s] = dictionary mag -> ratio for source s of variant v
-    # e.g. logictree/case_18_bis: 9 variants (3 abGR x 3 maxMagGR), the base
-    # is variant 2 (3 mags, rate 0.115893 at M 5.5); variant 3 has rate
-    # 0.284605 at M 5.5, i.e. ratio 2.4558, and variant 0 (maxMag 7.0)
-    # has no magnitude 7.5, i.e. ratio 0 for it
+    # e.g. logictree/case_18/job_bis: the 9 variants of a depth (3 abGR x
+    # 3 maxMagGR) are split by classical._split_by_mags in 6 variants with
+    # magnitudes 5.5, 6.5 (maxMag 7.0 and 7.3) and 3 with magnitudes 5.5,
+    # 6.5, 7.5 (maxMag 7.6); in the first call the base is variant 0, with
+    # rate 0.115893 at M 5.5, and variant 2 has rate 0.284605, i.e. ratio
+    # 2.4558; since the variants have the same magnitudes, no ratio is 0
     ratios = [[_mag_ratios(rates[b][s], rates[v][s])
                for s in range(len(sources))]
               for v in range(len(groups))]
@@ -322,10 +333,12 @@ def make_results(groups, cmakers, sites):
                         True).fill(False) for _ in groups]
     rmaker.source_data = AccumDict(accum=[])
     rups = [[] for _ in groups]  # the rup_data of each variant
-    # e.g. logictree/case_18_bis: the base has 6 ruptures, variant 1 (maxMag
-    # 7.3) has 4 and variant 0 (maxMag 7.0) has 4, see _scale_rups
+    # e.g. logictree/case_18/job_bis: 4 ruptures for each of the 6
+    # variants with magnitudes 5.5, 6.5 at a depth, see _scale_rups
     t0 = time.time()
+    cfactor0 = cm.cfactor.copy()  # see RmapMaker.make
     nctxs = _process_sources(rmaker, ratios, pnemaps, rups)
+    cfactor = cm.cfactor - cfactor0
     dt = (time.time() - t0) / len(sources)
     # the source data are recorded only for the first variant, the
     # others get zeros, otherwise the statistics would be repeated
@@ -336,7 +349,9 @@ def make_results(groups, cmakers, sites):
         sdata = rmaker.source_data if v == 0 else _zero_source_data(
             rmaker.source_data)
         rup_data = concat(rups[v]) if rups[v] else ()
-        dic = dict(rmap=pnemap.to_rates(), cfactor=cm.cfactor,
+        # the cfactor too is recorded only for the first variant
+        dic = dict(rmap=pnemap.to_rates(),
+                   cfactor=cfactor if v == 0 else numpy.zeros(2),
                    rup_data=rup_data, source_data=sdata,
                    task_no=rmaker.task_no, dparam_mb=0.,
                    source_mb=cm.source_mb)
@@ -383,6 +398,30 @@ def _process_sources(rmaker, ratios, pnemaps, rups):
     return nctxs
 
 
+# maximum number of floats of the contributions by source, see _update_linear
+MAX_LINEAR = 2 ** 24
+
+
+# NB: this is crucial for the performance of the BCHydro calculation
+def _update_linear(cm, pnemaps, R, ctxt, si, itime):
+    # Update the probability maps of the variants with the contexts of a
+    # single magnitude, for Poisson ruptures only. The rate of a row is
+    # occ_rate * R[v, s], and update_pmap_r adds rate * poe * itime to the
+    # map, so the contributions of each source are summed once, and each
+    # variant gets the sum of its contributions weighted by R[v, s]
+    pmap = pnemaps[0]
+    N, L, G = pmap.array.shape
+    contribs = numpy.zeros((N, L, len(R[0]), G))  # N, L, S, G
+    for poes, _, _, _, slc in cm._gen_poes(ctxt):
+        c = ctxt[slc]
+        sidxs = pmap.sidx[c.sids]
+        # NB: the rows of the same source and site are summed by add.at
+        contrib = poes.astype(F64) * (c.occurrence_rate * itime)[:, None, None]
+        numpy.add.at(contribs, (sidxs, slice(None), si[slc]), contrib)
+    for v, pnemap in enumerate(pnemaps):
+        pnemap.array += R[v] @ contribs
+
+
 def _update_chunk(cm, pnemaps, ratios, tspan, ctxs, sidxs):
     # Update the probability maps of the variants with the contexts of
     # several sources, computing the PoEs once per magnitude (see
@@ -406,6 +445,11 @@ def _update_chunk(cm, pnemaps, ratios, tspan, ctxs, sidxs):
     umags, starts, counts = numpy.unique(
         ctx.mag, return_index=True, return_counts=True)
     itime = tspan
+    # the rates are linear in the ratios only for Poisson ruptures, see
+    # _update_linear; the probability mode is not linear in the rates
+    linear = pnemaps[0].rates and not any(
+        len(probs) for probs in ctx.probs_occur)
+    S = len(ratios[0])
     for mag, start, count in zip(umags, starts, counts):
         ctxt = ctx[start:start+count]
         si = sidx[start:start+count]
@@ -413,6 +457,9 @@ def _update_chunk(cm, pnemaps, ratios, tspan, ctxs, sidxs):
         R = numpy.array([[r.get(float(mag), 0.) for r in rv]
                          for rv in ratios])
         cm.cfactor += [len(ctxt), 1]  # as in gen_poes
+        if linear and S * pnemaps[0].array.size <= MAX_LINEAR:
+            _update_linear(cm, pnemaps, R, ctxt, si, itime)
+            continue
         for poes, _, _, _, slc in cm._gen_poes(ctxt):
             c = ctxt[slc]
             # read the record fields once for all the variants

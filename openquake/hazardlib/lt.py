@@ -32,11 +32,7 @@ from openquake.hazardlib.sourceconverter import (
 from openquake.hazardlib import valid
 
 NOAPPLY_UNCERTAINTIES = [
-    'sourceModel', 'extendModel', 'gmpeModel', 'applyToTectonicRegionType']
-
-U32 = numpy.uint32
-# ts is the set of realizations with the same uncertainties (see get_ts_sets)
-ts_samples_dt = numpy.dtype([('trt_smr', U32), ('samples', U32), ('ts', U32)])
+    'sourceModel', 'extendModel', 'gmpeModel']
 
 
 class LogicTreeError(Exception):
@@ -594,6 +590,19 @@ GEOMETRY_PRESERVING = frozenset([
 
 # ######################### apply_uncertainties ########################### #
 
+def lt_source_id(source):
+    """
+    :param source: a source instance
+    :returns: the source ID as written in the logic tree
+
+    NB: sources with the same ID but different content in different
+    source models get the branch ID appended after a "!" (see
+    source_reader.add_bangs), i.e. 'src!b1' for 'src'; the "!" cannot
+    appear in the original IDs, so everything after it is removed
+    """
+    return source.source_id.split('!')[0]
+
+
 def get_bset_value(bset, value, source):
     """
     :param bset: a BranchSet instance
@@ -608,9 +617,10 @@ def get_bset_value(bset, value, source):
     applied after the splitting of the sources, as done by classical
     """
     if bset.correlated:
-        if source.source_id in value:
-            return True, value[source.source_id]
-        bname = valid.basename(source)
+        src_id = lt_source_id(source)
+        if src_id in value:
+            return True, value[src_id]
+        bname = valid.basename(src_id)
         return bname in value, value.get(bname)
     return bset.filter_source(source), value
 
@@ -731,39 +741,13 @@ def apply_uncertainties(bset_values, src_group, check=True):
 # ####################### uncertainties and sampling ###################### #
 
 
-def _ts_samples_array(src):
-    """
-    :returns: the ts_samples of the source as a structured array
-    """
-    ts_samples = src.ts_samples
-    if isinstance(ts_samples, list):
-        ts_samples = numpy.concatenate(ts_samples, dtype=ts_samples_dt)
-    return ts_samples
-
-
-def get_ts_sets(src):
-    """
-    :returns: a tuple of tuples of trt_smr, the sets of realizations with
-        the same uncertainties applied to the source; there is a single set
-        if the uncertainties are the same in all the realizations
-
-    NB: the sets are stored in the field ts of the ts_samples by
-        build_groups, i.e. for the sources modified by the uncertainties;
-        the sources without uncertainties have ts=0 everywhere and a
-        single set.
-    """
-    ts_samples = _ts_samples_array(src)
-    return tuple(tuple(ts_samples['trt_smr'][ts_samples['ts'] == ts])
-                 for ts in numpy.unique(ts_samples['ts']))
-
-
 def restrict_ts_samples(src, trt_smrs):
     """
     :returns: a copy of the source with the ts_samples restricted to
         trt_smrs, i.e. belonging to a single set of uncertainties
     """
     new = copy.copy(src)
-    ts_samples = _ts_samples_array(src)
+    ts_samples = src.get_ts_samples()
     new.ts_samples = ts_samples[
         numpy.isin(ts_samples['trt_smr'], trt_smrs)]
     return new
@@ -1073,7 +1057,7 @@ class BranchSet(object):
                 if value != source.tectonic_region_type:
                     return False
             elif key == 'applyToSources':
-                if source and source.source_id not in value:
+                if source and lt_source_id(source) not in value:
                     return False
             elif key == 'applyToBranches':
                 pass

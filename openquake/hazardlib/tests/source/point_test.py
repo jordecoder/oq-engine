@@ -499,6 +499,22 @@ class CollapsedPointSourceTestCase(unittest.TestCase):
         average = calc_average([ps1, ps2])
         self.assertAlmostEqual(average['strike'], 0.)
 
+    def test_single_source_nodal_plane_average(self):
+        # nodal planes of the padding sources in the ARB model; the
+        # arithmetic means would give strike=155 and rake=-40.5
+        npd = PMF([(.45, NodalPlane(130, 45, -90)),
+                   (.25, NodalPlane(300, 55, -90)),
+                   (.05, NodalPlane(100, 40, 90)),
+                   (.15, NodalPlane(30, 80, 0)),
+                   (.10, NodalPlane(120, 80, 180))])
+        ps = make_point_source(nodal_plane_distribution=npd)
+        average = calc_average([ps])
+        aac([average['strike'], average['dip'], average['rake']],
+            [105.3, 56., -85.6], atol=.1)
+        # the averaged plane is the one used for the far sites
+        for rup in ps.iruptures():
+            aac(rup.rake, -85.6, atol=.1)
+
     def test_ambiguous_strike_average(self):
         ps = make_point_source(
             nodal_plane_distribution=PMF([
@@ -547,6 +563,18 @@ class CollapsedPointSourceTestCase(unittest.TestCase):
             self.assertEqual(src1.code, src2.code)
             self.assertAlmostEqual(src1.location.x, src2.location.x)
             self.assertAlmostEqual(src1.location.y, src2.location.y)
+
+    def test_antimeridian(self):
+        # with these rates the weighted average of the longitudes is
+        # 180.00000000000003 in absolute value, outside the valid range;
+        # it happened in Alaska with ps_grid_spacing=15
+        for lon in (-180., 180.):
+            ps1 = make_point_source(
+                lon=lon, lat=52., mfd=EvenlyDiscretizedMFD(5, 1, [.003]))
+            ps2 = make_point_source(
+                lon=lon, lat=52.1, mfd=EvenlyDiscretizedMFD(5, 1, [.011]))
+            cps = CollapsedPointSource('1', [ps1, ps2])
+            self.assertEqual(cps.location.x, lon)
 
 
 class PointSourceDipFracsTestCase(unittest.TestCase):

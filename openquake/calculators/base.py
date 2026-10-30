@@ -519,7 +519,8 @@ def check_time_event(oqparam, occupancy_periods):
     with the periods found in the exposure.
     """
     time_event = oqparam.time_event
-    if time_event != 'avg' and time_event not in occupancy_periods:
+    if time_event not in (None, 'avg') and (
+            time_event not in occupancy_periods):
         raise ValueError(
             'time_event is %s in %s, but the exposure contains %s' %
             (time_event, oqparam.inputs['job_ini'],
@@ -623,8 +624,9 @@ class HazardCalculator(BaseCalculator):
                 'pointsource-distance')
         elif 'classical' in oq.calculation_mode:
             if oq.ps_grid_spacing:
-                logging.info('Using pointsource_distance=%s + %d',
-                             oq.pointsource_distance, int(oq.ps_grid_spacing))
+                logging.info('Using pointsource_distance=%s and '
+                             'ps_grid_spacing=%s', oq.pointsource_distance,
+                             oq.ps_grid_spacing)
             else:
                 logging.info('Using pointsource_distance=%s',
                              oq.pointsource_distance)
@@ -1096,6 +1098,10 @@ class HazardCalculator(BaseCalculator):
                     assetcol.tagcol.site_id.extend(range(self.N))
         else:  # no exposure
             self._read_no_exposure(haz_sitecol)
+        if hasattr(self, 'assetcol'):
+            # the occupants are computed only for the exposure time events
+            oq.set_time_events(self.assetcol.occupancy_periods)
+            self.datastore['oqparam'] = oq
         if (oq.calculation_mode.startswith(('event_based', 'ebrisk')) and
                 oq.ground_motion_fields and self.N > 1000 and
                 len(oq.min_iml) == 0):
@@ -1108,8 +1114,9 @@ class HazardCalculator(BaseCalculator):
             elif oq.job_type == 'risk' and 'exposure' not in oq.inputs:
                 raise ValueError('Missing exposure both in hazard and risk!'
                                  f' [hc_id={oq.hazard_calculation_id}]')
-            if (oq_hazard.time_event != 'avg' and
-                    oq_hazard.time_event != oq.time_event):
+            # None or avg in the hazard mean that all the times are stored
+            if oq.time_event and oq_hazard.time_event not in (
+                    None, 'avg', oq.time_event):
                 raise ValueError(
                     'The risk configuration file has time_event=%s but the '
                     'hazard was computed with time_event=%s' % (
@@ -1209,6 +1216,16 @@ class HazardCalculator(BaseCalculator):
                 assoc_dist = (oq.region_grid_spacing * 1.414
                               if oq.region_grid_spacing else ASSOC_DIST)
                 sm = readinput.get_site_model(oq, self.datastore.hdf5)
+                if oq.impact:
+                    # the grid sites have no parameters: add the site model
+                    # ones and the required ones, both to the sitecol and to
+                    # the complete sitecol
+                    params = set(sm.dtype.names) | set(oq.req_site_params)
+                    for name in sorted(params):
+                        if name in site.site_param_dt:
+                            dt = site.site_param_dt[name]
+                            self.sitecol.add_col(name, dt)
+                            self.sitecol.complete.add_col(name, dt)
                 if oq.prefer_global_site_params and not numpy.isnan(
                         oq.reference_vs30_value):
                     self.sitecol.set_global_params(oq, oq.req_site_params)
@@ -1221,7 +1238,7 @@ class HazardCalculator(BaseCalculator):
                             or oq.siteid else 'strict')
                     self.sitecol.assoc(sm, assoc_dist, mode,
                                        station_sids=station_sids)
-                    if 'station_data' in oq.inputs:
+                    if 'station_data' in oq.inputs or oq.impact:
                         # the complete sitecol is required
                         self.sitecol.complete.assoc(sm, assoc_dist, mode,
                                                     station_sids=station_sids)
@@ -1237,6 +1254,12 @@ class HazardCalculator(BaseCalculator):
                     self.sitecol.calculate_z1pt0()
                 if 'z2pt5' in names:
                     self.sitecol.calculate_z2pt5()
+
+            # NaN check on core params after final site-model association:
+            # catches silent zero hazard from missing z1pt4 and similar
+            self.sitecol.check_nan(
+                [p for p in site.CORE_SITE_PARAMS
+                 if p in oq.req_site_params])
 
             self.datastore['sitecol'] = self.sitecol
             if self.sitecol is not self.sitecol.complete:

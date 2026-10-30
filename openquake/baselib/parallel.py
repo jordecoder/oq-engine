@@ -203,10 +203,10 @@ import psutil
 import numpy
 
 from openquake.baselib import config, hdf5
-from openquake.baselib.general import decode
+from openquake.baselib.general import decode, gc_disabled
 from openquake.baselib.zeromq import zmq, Socket
 from openquake.baselib.performance import (
-    Monitor, memory_gb, init_performance)
+    Monitor, PerfBuffer, memory_gb, init_performance)
 from openquake.baselib.general import (
     split_in_blocks, block_splitter, AccumDict, humansize, CallableDict,
     gettemp, engine_version, shortlist, compress, decompress, mp as mp_context)
@@ -217,6 +217,18 @@ submit = CallableDict()
 MB = 1024 ** 2
 GB = 1024 ** 3
 host_cores = config.zworkers.host_cores.split(',')
+
+
+def parse_hostcore(hostcore, default_port):
+    """
+    :param hostcore: a string "host cores" or "host:port cores"
+    :param default_port: the ctrl_port to use if the port is missing
+    :returns: a triple (host, port, cores) with port an integer
+    """
+    hostport, cores = hostcore.split()
+    host, sep, port = hostport.partition(':')
+    # without an explicit port the default ctrl_port is used
+    return host, (int(port) if sep else int(default_port)), cores
 
 
 def calc_dir(job_id_or_fname):
@@ -255,8 +267,8 @@ def processpool_submit(self, func, args, monitor):
 @submit.add('zmq', 'slurm')
 def zmq_submit(self, func, args, monitor):
     idx = self.task_no % len(host_cores)
-    host = host_cores[idx].split()[0]
-    port = int(config.zworkers.ctrl_port)
+    host, port, _cores = parse_hostcore(
+        host_cores[idx], config.zworkers.ctrl_port)
     dest = 'tcp://%s:%d' % (host, port)
     logging.debug('Sending to %s', dest)
     with Socket(dest, zmq.REQ, 'connect', timeout=300) as sock:
@@ -419,7 +431,11 @@ class Result(object):
         Returns the underlying value or raise the underlying exception
         """
         t0 = time.time()
-        val = self.pik.unpickle()
+        # disabling the garbage collector makes the unpickling of
+        # millions of objects (for instance the sources returned by
+        # preclassical) much faster
+        with gc_disabled():
+            val = self.pik.unpickle()
         self.dt = time.time() - t0
         if self.tb_str:
             etype = val.__class__
@@ -445,10 +461,10 @@ class Result(object):
                     'The master is at version %s while the worker %s is at '
                     'version %s' % (mon.version, socket.gethostname(),
                                     engine_version()))
-            if mon.database_host != config.dbserver.host:
+            if mon.database_host != config.server.host:
                 raise RuntimeError(
                     'The worker has database.host=%s while the master has %s'
-                    % (mon.database_host, config.dbserver.host))
+                    % (mon.database_host, config.server.host))
             with mon:
                 val = func(*args)
         except StopIteration:
@@ -823,8 +839,12 @@ class Starmap(object):
         return cls(task, taskargs, distribute, progress, h5)
 
     def __init__(self, task_func, task_args=(), distribute=None,
-                 progress=logging.info, h5=None):
+                 progress=logging.info, h5=None, perf='datastore'):
+        # perf 'datastore': the performance info is saved in h5 (an
+        # hdf5.File or a DataStore); perf 'memory': h5 must be a DataStore,
+        # the performance info is kept in memory and saved into it at the end
         self.__class__.init(distribute=distribute)
+        self.perf = perf
         self.task_func = task_func
         if h5:
             match = re.search(r'(\d+)', os.path.basename(h5.filename))
@@ -835,12 +855,15 @@ class Starmap(object):
             h5 = hdf5.File(gettemp(suffix='.hdf5'), 'w')
             init_performance(h5)
         self.name = task_func.__name__
-        self.monitor = Monitor(self.name, database_host=config.dbserver.host)
+        self.monitor = Monitor(self.name, database_host=config.server.host)
         self.monitor.filename = h5.filename
         self.monitor.calc_id = self.calc_id
         if distribute == 'zmq':
             self.monitor.version = h5['/'].attrs.get('engine_version')
         self.progress = progress
+        if perf == 'memory':
+            self.dstore = h5
+            h5 = PerfBuffer()
         self.h5 = h5
         self.task_queue = []
         try:
@@ -852,11 +875,11 @@ class Starmap(object):
         self.sent = AccumDict(accum=AccumDict())  # fname -> argname -> nbytes
         self.monitor.inject = (self.argnames[-1].startswith('mon') or
                                self.argnames[-1].endswith('mon'))
-        self.receiver = 'tcp://0.0.0.0:%s' % config.dbserver.receiver_ports
+        self.receiver = 'tcp://0.0.0.0:%s' % config.server.receiver_ports
         if self.distribute in ('no', 'processpool') or sys.platform != 'linux':
             self.return_ip = '127.0.0.1'  # zmq returns data to localhost
         else:  # zmq returns data to the receiver_host
-            self.return_ip = get_return_ip(config.dbserver.receiver_host)
+            self.return_ip = get_return_ip(config.server.receiver_host)
             logging.debug(f'{self.return_ip=}')
         self.monitor.backurl = None  # overridden later
         self.tasks = {}  # populated by .submit
@@ -998,8 +1021,24 @@ class Starmap(object):
         while self.inproc:
             yield self.inproc.popleft()
 
+    def save_info(self):
+        """
+        :returns: True if the performance info can be saved in self.h5
+        """
+        return self.perf == 'memory' or self.h5.mode != 'r'
+
     def _loop(self):
+        # the performance info is merged also when the iteration is
+        # stopped early, since the generator is closed in that case
+        try:
+            yield from self._loop_tasks()
+        finally:
+            if self.perf == 'memory':
+                self._merge_performance()
+
+    def _loop_tasks(self):
         self.busytime = AccumDict()  # name -> pid -> time
+        self.subtask_names = set()  # names of the subtasks generated
         dist = 'no' if self.num_tasks == 1 else self.distribute
         if dist == 'slurm':
             self.monitor.task_no = self.task_no  # total number of tasks
@@ -1031,6 +1070,7 @@ class Starmap(object):
             elif res.msg == 'TASK_ENDED':
                 self._task_ended(res, finished)
             elif res.func:  # add subtask
+                self.subtask_names.add(res.func.__name__)
                 self.task_queue.append((res.func, res.pik))
                 self._submit_many(1)
             else:
@@ -1043,16 +1083,32 @@ class Starmap(object):
         if self.expected_outputs:
             assert self.expected_outputs == self.n_out, (
                 self.expected_outputs, self.n_out)
-        # NB: a Starmap can generate tasks with different names, as
+        # NB: a Starmap can generate subtasks with different names, as
         # preclassical -> filter_weight, or classical -> baseclassical
         # when the tasks are split for being too slow (see the comment
-        # in classical.py); there is one row per task name, so that the
-        # tasks of different kinds are not mixed together
+        # in classical.py); the busy times of the subtasks are summed to
+        # the ones of the Starmap, per worker, so that the efficiency is
+        # computed from the total busy times and ascribed to the Starmap
+        for name in self.subtask_names & set(self.busytime):
+            base = self.busytime.pop(name)
+            parent = self.busytime.setdefault(self.name, AccumDict(accum=0.))
+            parent += base
         for name, dic in self.busytime.items():
             if len(dic) > 1:  # no statistics with a single core
                 times = numpy.array(list(dic.values()))
-                if self.h5.mode != 'r':
+                if self.save_info():
                     self.monitor.save_starmap_info(self.h5, name, times)
+
+    def _merge_performance(self):
+        # save the performance info collected in memory and the task_sent
+        # in the datastore, which is opened in 'a' mode for the purpose
+        dstore = self.dstore
+        with dstore.reopen('a'):
+            for name, rows in self.h5.tables.items():
+                hdf5.extend(dstore.hdf5[name], numpy.concatenate(rows))
+            task_sent = ast.literal_eval(decode(dstore['task_sent'][()]))
+            task_sent.update(self.sent)
+            dstore['task_sent'] = str(task_sent)
 
     def _task_ended(self, res, finished):
         finished.add(res.mon.task_no)
@@ -1064,20 +1120,21 @@ class Starmap(object):
         todo = set(range(self.task_no)) - finished
         logging.debug('%d tasks todo %s', len(todo),
                       shortlist(sorted(todo)))
-        task_sent = ast.literal_eval(decode(self.h5['task_sent'][()]))
-        task_sent.update(self.sent)
-        if self.h5.mode != 'r':
-            del self.h5['task_sent']
-            self.h5['task_sent'] = str(task_sent)
+        if self.perf != 'memory':  # task_sent is saved at the end otherwise
+            task_sent = ast.literal_eval(decode(self.h5['task_sent'][()]))
+            task_sent.update(self.sent)
+            if self.save_info():
+                del self.h5['task_sent']
+                self.h5['task_sent'] = str(task_sent)
         if self.distribute in ('zmq', 'slurm'):
             mem_gb = 0
             if res.mon.task_no % 10 == 0:
                 # measure the memory only for 1 task out of 10
                 # with 8 nodes the time to get the memory is 0.01 secs
                 for line in host_cores:
-                    host, _cores = line.split()
-                    addr = 'tcp://%s:%s' % (
-                        host, config.zworkers.ctrl_port)
+                    host, port, _cores = parse_hostcore(
+                        line, config.zworkers.ctrl_port)
+                    addr = 'tcp://%s:%s' % (host, port)
                     with Socket(addr, zmq.REQ, 'connect') as sock:
                         mem_gb += sock.send('memory_gb')
         elif self._shared:
@@ -1091,13 +1148,25 @@ class Starmap(object):
                 mem_gb = memory_gb()
         else:
             mem_gb = 0
-        if self.h5.mode != 'r':
+        if self.save_info():
             res.mon.save_task_info(self.h5, res, name, mem_gb)
             res.mon.flush(self.h5)
 
     def __del__(self):
         if hasattr(self, 'socket'):
             self.socket.close()
+
+
+def heaviest_first(allargs, weights):
+    """
+    :param allargs: a list of task arguments
+    :param weights: a list of weights, one for each task
+    :returns: the task arguments sorted by decreasing weight, so that the
+              heaviest tasks are submitted first and do not end up last
+              with most of the cores idle
+    """
+    order = numpy.argsort(-numpy.array(weights), kind='stable')
+    return [allargs[i] for i in order]
 
 
 def sequential_apply(task, args, concurrent_tasks=Starmap.CT,

@@ -33,7 +33,9 @@ U16 = numpy.uint16
 U32 = numpy.uint32
 I64 = numpy.int64
 F32 = numpy.float32
+F64 = numpy.float64
 TWO24 = 2 ** 24
+RATES_BLOCK = 2 ** 22  # rows of _rates read at once, to bound the memory
 by_taxonomy = operator.attrgetter('taxonomy')
 code2cls = BaseRupture.init()
 weight = operator.itemgetter('n_occ')
@@ -188,6 +190,24 @@ def get_num_chunks(dstore, full_lt=None):
     # req_gb=202, N=260,000 => 202
 
 
+def get_imt_gweights(full_lt, trt_smrs, imtls):
+    """
+    :param full_lt: an initialized FullLogicTree
+    :param trt_smrs: a list of trt_smrs
+    :param imtls: a DictArray of IMTs
+    :returns: an array of shape (Gt, M) with the weights of each IMT,
+        the columns being in the same order as the IMTs in imtls
+
+    NB: the weights of the logic tree are stored in the order of the
+    IMTs appearing in the branches, which is not necessarily the order
+    of the IMTs in the calculation, so the mapping must be done with
+    the IMTWeigher (see IMTWeigher.__call__)
+    """
+    gweights = full_lt.g_weights(trt_smrs)  # (Gt, M+1)
+    wget = full_lt.gsim_lt.wget
+    return numpy.array([wget(gweights, imt) for imt in imtls]).T
+
+
 def map_getters(dstore, full_lt=None, oq=None, disagg=False):
     """
     :returns: a list of pairs (MapGetter, weights)
@@ -203,7 +223,7 @@ def map_getters(dstore, full_lt=None, oq=None, disagg=False):
     _req_gb, trt_rlzs, trt_smrs = get_rmap_gb(dstore, full_lt)
     attrs = vars(full_lt)
     if oq.fastmean:
-        gweights = [full_lt.g_weights(trt_smrs)]
+        gweights = [get_imt_gweights(full_lt, trt_smrs, oq.imtls)]
     else:
         wgets = [full_lt.gsim_lt.wget]
     for label in oq.site_labels:
@@ -212,7 +232,7 @@ def map_getters(dstore, full_lt=None, oq=None, disagg=False):
         flt.gsim_lt = dstore['gsim_lt' + label]
         flt.init()
         if oq.fastmean:
-            gweights.append(flt.g_weights(trt_smrs))
+            gweights.append(get_imt_gweights(flt, trt_smrs, oq.imtls))
         else:
             wgets.append(flt.gsim_lt.wget)
     fnames = [dstore.filename]
@@ -294,8 +314,8 @@ class DeltaRatesGetter(object):
         self.dstore = dstore
 
     def __call__(self, src_id):
-        with self.dstore.open('r') as dstore:
-            return dstore['delta_rates'][src_id]
+        with self.dstore:  # opened and closed here, if not already open
+            return self.dstore['delta_rates'][src_id]
 
 
 class MapGetter(object):
@@ -344,34 +364,51 @@ class MapGetter(object):
             return self.array
         sid2idx = {sid: idx for idx, sid in enumerate(self.sids)}
         self.array = numpy.zeros((self.N, self.L, self.Gt))  # move to 32 bit
+        lookup = numpy.full(max(sid2idx) + 1, -1, int)
+        for sid, idx in sid2idx.items():
+            lookup[sid] = idx
         for fname in self.filenames:
-            with hdf5.File(fname) as dstore:
-                slices = dstore['_rates/slice_by_idx'][:]
-                slices = slices[slices['idx'] == self.chunk]
-                if len(slices) == 0:
+            self.read_chunk(fname, lookup)
+        self.sid2idx = sid2idx
+        return self.array
+
+    def read_chunk(self, fname, lookup):
+        """
+        Add the rates of the chunk stored in the file fname to self.array
+
+        :param fname: the path to a datastore with a _rates group
+        :param lookup: an array mapping site IDs to indices of self.array
+        """
+        with hdf5.File(fname) as dstore:
+            slices = dstore['_rates/slice_by_idx'][:]
+            slices = slices[slices['idx'] == self.chunk]
+            if len(slices) == 0:
+                return
+            # read each column block by block (reading slice by slice
+            # is slow) and select the rows of the slices of this chunk
+            n = len(dstore['_rates/rate'])
+            for a in range(0, n, RATES_BLOCK):
+                b = min(a + RATES_BLOCK, n)
+                # clip the slices to the block and mark their rows
+                start = numpy.clip(slices['start'], a, b) - a
+                stop = numpy.clip(slices['stop'], a, b) - a
+                marks = numpy.zeros(b - a + 1, int)
+                numpy.add.at(marks, start, 1)
+                numpy.add.at(marks, stop, -1)
+                mask = numpy.cumsum(marks[:-1]) > 0
+                if not mask.any():
                     continue
-                # read each column once (reading slice by slice is slow)
-                # and select the rows of the slices of this chunk
-                n = len(dstore['_rates/rate'])
-                marks = numpy.zeros(n + 1, int)
-                numpy.add.at(marks, slices['start'], 1)
-                numpy.add.at(marks, slices['stop'], -1)
-                mask = numpy.cumsum(marks[:n]) > 0
-                sids = dstore['_rates/sid'][:][mask]
-                lid = dstore['_rates/lid'][:][mask]
-                gid = dstore['_rates/gid'][:][mask]
-                rate = dstore['_rates/rate'][:][mask]
-        # NB: numpy.add.at is needed since the same (sid, lid, gid) can
-        # appear several times, and fancy-index += would drop duplicates
-                lookup = numpy.full(max(sid2idx) + 1, -1, int)
-                for sid, idx in sid2idx.items():
-                    lookup[sid] = idx
+                sids = dstore['_rates/sid'][a:b][mask]
+                lid = dstore['_rates/lid'][a:b][mask]
+                gid = dstore['_rates/gid'][a:b][mask]
+                rate = dstore['_rates/rate'][a:b][mask]
                 idxs = lookup[sids]
                 if (idxs < 0).any():
                     raise KeyError('unknown site IDs in _rates')
+                # NB: numpy.add.at is needed since the same
+                # (sid, lid, gid) can appear several times, and
+                # fancy-index += would drop duplicates
                 numpy.add.at(self.array, (idxs, lid, gid), rate)
-        self.sid2idx = sid2idx
-        return self.array
 
     def get_hcurve(self, sid):  # used in classical
         """
@@ -395,17 +432,17 @@ class MapGetter(object):
         M = self.M
         L1 = self.L // M
         means = MapArray(U32(self.sids), M, L1).fill(0)
-        gweights = self.gweights[0]
-        imt_dep_weights = gweights.shape[1] > 1
         for sid in self.sids:
+            gweights = self.gweights[0]  # (Gt, M), one column per IMT
             if len(self.ilabels):
                 gweights = self.gweights[self.ilabels[sid]]
             rates = self.array[self.sid2idx[sid]]  # shape (L, G)
             sidx = means.sidx[sid]
             for m in range(M):
-                means.array[sidx, m] = rates[m*L1: m*L1+L1] @ gweights[
-                    :, m if imt_dep_weights else -1]
-        means.array[:] = to_probs(means.array)
+                means.array[sidx, m] = rates[m*L1: m*L1+L1] @ gweights[:, m]
+        # NB: the conversion must be done in float64, otherwise the
+        # cancellation in 1 - exp(-rate) is catastrophic for small rates
+        means.array[:] = to_probs(means.array.astype(F64))
         return means
 
 

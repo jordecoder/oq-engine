@@ -23,16 +23,25 @@ from io import BytesIO
 from pathlib import Path
 from PIL import Image as PILImage
 from openquake import baselib
+from openquake.baselib.general import humanize_number
 from openquake.calculators.country_impact_report_utils import (
     EventContext, ReportOptions, LOSS_METADATA, _read_countries_info,
     _read_world_cities, build_classifiers, load_admin_boundaries,
     points_to_gdf, aggregate_losses, save_most_affected_regions,
-    get_configured_path)
+    get_configured_path, get_report_time_event)
 from openquake.calculators.postproc.plots import plot_variable, MapDataElements
 from openquake.hazardlib.calc.filters import upper_maxdist
 
 COUNTRY_PROFILES_BASE_URL = "https://github.com/gem/risk-profiles/tree/master"
 REPORT_DPI = 30 if any('pytest' in arg for arg in sys.argv) else 300
+
+
+def _humanize_summary_value(value):
+    # Apply the shared numeric formatter to both endpoints of loss ranges.
+    parts = str(value).split(" - ")
+    return " - ".join(
+        humanize_number(part.replace(",", ""), precision=1)
+        for part in parts)
 
 
 class CountryImpactReportBuilder:
@@ -96,6 +105,7 @@ class CountryImpactReportBuilder:
         self.event_date = event.date
         self.shakemap_version = event.shakemap_version
         self.hypocenter = event.hypocenter
+        self.rupture = event.rupture
 
         # Unpacking ReportOptions
         self.disclaimer_txt = options.disclaimer_txt
@@ -299,7 +309,8 @@ class CountryImpactReportBuilder:
         meta.append(f'Number of ground motion fields:'
                     f' {oqparam.number_of_ground_motion_fields}')
         meta.append(f'Truncation level: {oqparam.truncation_level}')
-        meta.append(f'Considered time of the event: {oqparam.time_event}')
+        meta.append('Considered time of the event: '
+                    f'{get_report_time_event(oqparam)}')
         return notes_data
 
     def _get_cities_in_viewport(self, num_cities=15):
@@ -375,7 +386,9 @@ class CountryImpactReportBuilder:
                 x_limits=self.x_limits,
                 y_limits=self.y_limits,
                 basemap_path=self.basemap_path,
-                epicenter=self.hypocenter
+                epicenter=self.hypocenter,
+                rupture=self.rupture,
+                scale_bar=True
             )
             fig, ax = plot_variable(
                 aggloss_df, admin_boundaries, label,
@@ -524,10 +537,10 @@ class CountryImpactReportBuilder:
                 exposed_key = meta["label"] + "_exposed"
             table_data.append([
                 self.Paragraph(meta["label"], body_left_style),
-                self.Paragraph(self.summary_data[exposed_key],
-                               body_right_style),
-                self.Paragraph(self.summary_data[meta["label"]],
-                               body_right_style)
+                self.Paragraph(_humanize_summary_value(
+                    self.summary_data[exposed_key]), body_right_style),
+                self.Paragraph(_humanize_summary_value(
+                    self.summary_data[meta["label"]]), body_right_style)
             ])
         summary_table = self.Table(
             table_data,
@@ -558,9 +571,11 @@ class CountryImpactReportBuilder:
             self.Spacer(1, 6),
         ]
 
+        # the maximum distance is computed from the rupture, if available
+        source = 'rupture' if self.rupture is not None else 'epicentre'
         exposed_value_txt = (
             f'The exposed value refers to the assets and population located'
-            f' within a {self.maximum_distance}km radius of the epicentre.')
+            f' within a {self.maximum_distance} km radius of the {source}.')
         left_bundle.append(
             self.Paragraph(exposed_value_txt, body_left_style))
         if self.no_uncertainty:

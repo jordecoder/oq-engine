@@ -17,6 +17,7 @@
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import sys
 import logging
 from dataclasses import dataclass
 import numpy
@@ -33,6 +34,10 @@ from openquake.hazardlib.scalerel import get_available_magnitude_scalerel
 from openquake.hazardlib.nrml import validators as nrml_validators
 
 MOSAIC_DIR = config.directory.mosaic_dir or os.path.dirname(mosaic.__file__)
+
+
+# the test mode keeps the impact grids small, see base.py get_aelo_changelog
+TEST_MODE = 'pytest' in sys.argv[0] or bool(os.environ.get('OQ_TEST'))
 
 
 @dataclass
@@ -54,6 +59,10 @@ class ImpactParam:
     description: str = None
     notes: str = None
     make_impact_reports: bool = False
+    region_grid_spacing: float = 10 if TEST_MODE else 1  # km, mandatory
+    within_event_correlation_model: str = None
+    calculation_mode: str = 'scenario_risk'  # hidden from the form
+    within_event_correlation_params: dict = None
 
     def get_oqparams(self, usgs_id, mosaic_models, trts, use_shakemap):
         """
@@ -85,10 +94,14 @@ class ImpactParam:
             base_path='',  # no .ini file
             description=self.description,
             notes=self.notes,
-            calculation_mode='scenario_risk',
+            calculation_mode=self.calculation_mode,
             rupture_dict=str(rupdic),
-            time_event=self.time_event,
+            # time_event is not set, so the occupants losses are computed
+            # for day, night and transit; the selected time is used only
+            # in the country reports
+            report_time_event=self.time_event,
             maximum_distance=str(self.maximum_distance),
+            region_grid_spacing=str(self.region_grid_spacing),
             mosaic_model=self.mosaic_model,
             tectonic_region_type=self.trt,
             truncation_level=str(self.truncation_level),
@@ -105,6 +118,11 @@ class ImpactParam:
             params['gsim'] = '[FromFile]'
         if self.local_timestamp is not None:
             params['local_timestamp'] = self.local_timestamp
+        if self.within_event_correlation_model is not None:
+            params['within_event_correlation_model'] = (
+                self.within_event_correlation_model)
+            params['within_event_correlation_params'] = str(
+                self.within_event_correlation_params or {})
         if self.maximum_distance_stations is not None:
             params['maximum_distance_stations'] = str(
                 self.maximum_distance_stations)
@@ -119,7 +137,7 @@ class ImpactParam:
         oq = readinput.get_oqparam(params)
         # NB: fake h5 to cache `get_site_model` and avoid multiple associations
         _sitecol, assetcol, _discarded, _exp = readinput.get_sitecol_assetcol(
-            oq, h5={'performance_data': hdf5.FakeDataset()})
+            oq, h5=hdf5.FakeH5())
         id0s = numpy.unique(assetcol['ID_0'])
         countries = set(assetcol.tagcol.ID_0[i] for i in id0s)
         tmap_keys = get_tmap_keys(self.exposure_hdf5, countries)
@@ -152,6 +170,7 @@ IMPACT_FORM_LABELS = {
     'truncation_level': 'Level of truncation',
     'number_of_ground_motion_fields': 'Number of ground motion fields',
     'asset_hazard_distance': 'Asset hazard distance (km)',
+    'region_grid_spacing': 'Region grid spacing (km)',
     'ses_seed': 'Random seed (ses_seed)',
     'station_data_file_from_usgs': 'Station data from USGS',
     'station_data_file': 'Station data CSV',
@@ -162,6 +181,9 @@ IMPACT_FORM_LABELS = {
     'notes': 'Notes',
     'no_uncertainty': 'No uncertainty',
     'make_impact_reports': 'Make one-page country reports',
+    'calculation_mode': 'Calculation mode',
+    'within_event_correlation_model': 'Within-event correlation model',
+    'within_event_correlation_params': 'Within-event correlation params',
 }
 
 IMPACT_FORM_PLACEHOLDERS = {
@@ -184,6 +206,7 @@ IMPACT_FORM_PLACEHOLDERS = {
     'truncation_level': 'float ≥ 0',
     'number_of_ground_motion_fields': 'float ≥ 1',
     'asset_hazard_distance': 'float ≥ 0',
+    'region_grid_spacing': 'float > 0',
     'ses_seed': 'int ≥ 0',
     'station_data_file_from_usgs': '',
     'station_data_file': 'Station data CSV',
@@ -193,6 +216,53 @@ IMPACT_FORM_PLACEHOLDERS = {
     'description': 'Leave blank to set automatically',
     'notes': '',
 }
+
+# maximum value of maximum_distance (in km) allowed to level 1 users
+MAX_DISTANCE_LEVEL1 = 500
+
+# upper magnitude bounds and corresponding default maximum distances (km);
+# for magnitudes above the last bound the last distance is used
+MAG_BOUNDS = numpy.array([5.5, 6., 6.5, 7., 7.5])
+MAG_DISTANCES = numpy.array([50, 100, 150, 200, 250, 300])
+
+
+def get_default_maximum_distance(mag):
+    """
+    :param mag: magnitude of the rupture
+    :returns: the default maximum distance in km for the given magnitude
+
+    >>> [get_default_maximum_distance(mag) for mag in [5.5, 5.6, 6., 6.5]]
+    [50, 100, 100, 150]
+    >>> [get_default_maximum_distance(mag) for mag in [7., 7.5, 7.6, 9.]]
+    [200, 250, 300, 300]
+    """
+    return int(MAG_DISTANCES[numpy.searchsorted(MAG_BOUNDS, mag)])
+
+
+# upper magnitude bounds and corresponding default truncation levels;
+# for magnitudes above the last bound the last level is used
+TRUNC_MAG_BOUNDS = numpy.array([5.5, 6.5, 7.5])
+TRUNC_LEVELS = numpy.array([0, 1, 2, 3])
+
+
+def get_default_truncation_level(mag):
+    """
+    :param mag: magnitude of the rupture
+    :returns: the default truncation level for the given magnitude
+
+    >>> [get_default_truncation_level(mag) for mag in [5.5, 5.6, 6.5, 6.6]]
+    [0, 1, 1, 2]
+    >>> [get_default_truncation_level(mag) for mag in [7.5, 7.6, 9.]]
+    [2, 3, 3]
+    """
+    return int(TRUNC_LEVELS[numpy.searchsorted(TRUNC_MAG_BOUNDS, mag)])
+
+
+# form fields whose default depends on the magnitude of the rupture
+MAG_DEPENDENT_DEFAULTS = {
+    'maximum_distance': get_default_maximum_distance,
+    'truncation_level': get_default_truncation_level}
+
 
 IMPACT_FORM_DEFAULTS = {
     'usgs_id': '',
@@ -208,10 +278,11 @@ IMPACT_FORM_DEFAULTS = {
     'time_event': 'day',
     'dip': '90',
     'strike': '0',
-    'maximum_distance': '300',
-    'truncation_level': '3',
+    'maximum_distance': '',  # depends on the magnitude
+    'truncation_level': '',  # depends on the magnitude
     'number_of_ground_motion_fields': '100',
     'asset_hazard_distance': '15',
+    'region_grid_spacing': '10' if TEST_MODE else '1',
     'ses_seed': '42',
     'station_data_file_from_usgs': '',
     'station_data_file': '',
@@ -261,11 +332,16 @@ validators = {
     'truncation_level': valid.positivefloat,
     'number_of_ground_motion_fields': valid.positiveint,
     'asset_hazard_distance': valid.positivefloat,
+    # zero would be taken as unset by the engine, so it is rejected here
+    'region_grid_spacing': lambda v: valid.positivefloat(valid.nonzero(v)),
     'ses_seed': valid.positiveint,
     'maximum_distance_stations': valid.positivefloat,
     'description': valid.utf8,  # if empty, it will be set automatically
     'notes': valid.utf8,
     'make_impact_reports': valid.boolean,
+    'within_event_correlation_model': valid.NoneOr(valid.utf8_not_empty),
+    'calculation_mode': valid.Choice('scenario', 'scenario_risk'),
+    'within_event_correlation_params': valid.dictionary,
 }
 
 
@@ -284,7 +360,8 @@ def _validate(POST):
             value = validation_func(POST.get(field))
         except Exception as exc:
             blankable = ['dip', 'strike', 'maximum_distance_stations',
-                         'local_timestamp', 'notes']
+                         'local_timestamp', 'notes', 'maximum_distance',
+                         'truncation_level']
             if field in blankable and POST.get(field) == '':
                 if field in inputdic:
                     inputdic[field] = None
@@ -372,6 +449,14 @@ def impact_validate(POST, user, rupture_file=None, station_data_file=None,
     inputdic, params, err = _validate(POST)
     if err:
         return None, inputdic, params, err
+    maxdist = params.get('maximum_distance')
+    if (user.level < 2 and maxdist is not None
+            and maxdist > MAX_DISTANCE_LEVEL1):
+        err = {"status": "failed",
+               "error_msg": (f'{IMPACT_FORM_LABELS["maximum_distance"]}'
+                             f' cannot exceed {MAX_DISTANCE_LEVEL1} km'),
+               "invalid_inputs": ['maximum_distance']}
+        return None, inputdic, params, err
 
     # NOTE: in level 1 interface the ShakeMap has to be used.
     #       in level 2 interface it depends from the selected approach
@@ -418,6 +503,9 @@ def impact_validate(POST, user, rupture_file=None, station_data_file=None,
         params['description'] = inputdic['description']
     if 'notes' in inputdic:
         params['notes'] = inputdic['notes']
+    for field, get_default in MAG_DEPENDENT_DEFAULTS.items():
+        if params.get(field, 0) is None:
+            params[field] = get_default(rupdic['mag'])
     if len(params) > 1:  # called by impact_run
         params['rupture_dict'] = rupdic
         params['station_data_file'] = station_data_file
@@ -432,4 +520,7 @@ def impact_validate(POST, user, rupture_file=None, station_data_file=None,
                 err = {"status": "failed", "error_msg": str(exc)}
         return rup, rupdic, oqparams, err
     else:  # called by impact_get_rupture_data
+        # used by the UI to prefill the fields depending on the magnitude
+        for field, get_default in MAG_DEPENDENT_DEFAULTS.items():
+            rupdic[field] = get_default(rupdic['mag'])
         return rup, rupdic, params, err

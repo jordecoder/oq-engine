@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
+# NB: run these tests with OQ_APPLICATION_MODE=IMPACT,
 import time
 import os
 import sys
@@ -39,7 +40,7 @@ from openquake.server.views import format_oqparam
 from openquake.server.tests.views_test import (
     get_or_create_user, start_webui, stop_webui)
 
-CALC_RUN_TIMEOUT = 60
+CALC_RUN_TIMEOUT = 100
 
 
 def test_format_oqparam_displays_selected_nodal_plane():
@@ -49,12 +50,14 @@ def test_format_oqparam_displays_selected_nodal_plane():
             'shakemap_desc': 'v10', 'nodal_plane': 'NP2', 'lon': 1,
             'lat': 2, 'dep': 3, 'mag': 4, 'msr': 'WC1994',
             'aspect_ratio': 2, 'rake': 90, 'dip': 45, 'strike': 10},
-        time_event='day', maximum_distance={'default': [[0, 300]]},
+        time_event=None, report_time_event='night',
+        maximum_distance={'default': [[0, 300]]},
         truncation_level=3, number_of_ground_motion_fields=10,
         asset_hazard_distance={'default': 15}, ses_seed=42,
         mosaic_model='MODEL', tectonic_region_type='TRT', inputs={})
     inputs = format_oqparam(oqparam)
     assert inputs['Nodal plane'] == 'NP2'
+    assert inputs['Time of the event'] == 'night'
     assert list(inputs).index('Nodal plane') < list(inputs).index(
         'Magnitude scaling relationship')
 
@@ -305,15 +308,33 @@ class ImpactModeTestCase(django.test.TransactionTestCase):
         if 'make_impact_reports' in data:
             with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
                 impact_iso3_list = list(ds['impact'])
-                self.assertGreater(len(impact_iso3_list), 0)
-                for iso3 in impact_iso3_list:
-                    ret = self.c.get(
-                        f'/v1/calc/{job_id}/impact_report?iso3={iso3}')
-                    self.assertEqual(ret.status_code, 200)
-                    ret = self.c.get(
-                        f'/v1/calc/{job_id}/impact_report?iso3={iso3}'
-                        f'&format=png')
-                    self.assertEqual(ret.status_code, 200)
+            self.assertGreater(len(impact_iso3_list), 0)
+            impact_resources = self.get_json(
+                f'{job_id}/impact_resources')
+            country_reports = impact_resources['country_reports']
+            self.assertEqual(set(country_reports), set(impact_iso3_list))
+            for urls in country_reports.values():
+                self.assertIn('format=pdf', urls['pdf'])
+                self.assertIn('format=png', urls['png'])
+            self.assertEqual(
+                set(impact_resources),
+                {'avg_gmf_plots', 'assets', 'aggrisk', 'aggrisk_tags',
+                 'exposure_by_mmi', 'exposure_by_lse', 'country_reports'})
+            self.assertIsInstance(impact_resources['avg_gmf_plots'], dict)
+            for imt, url in impact_resources['avg_gmf_plots'].items():
+                self.assertIn(f'avg_gmf-{imt}.png', url)
+            for peril_outputs in impact_resources['exposure_by_lse'].values():
+                if peril_outputs:
+                    self.assertEqual(
+                        set(peril_outputs), {'json', 'table', 'npz'})
+            for iso3 in impact_iso3_list:
+                ret = self.c.get(
+                    f'/v1/calc/{job_id}/impact_report?iso3={iso3}')
+                self.assertEqual(ret.status_code, 200)
+                ret = self.c.get(
+                    f'/v1/calc/{job_id}/impact_report?iso3={iso3}'
+                    f'&format=png')
+                self.assertEqual(ret.status_code, 200)
 
             # Run the command-line extractor against the datastore generated
             # by this test.  Hide xdg-open from PATH so the test does not
@@ -480,6 +501,33 @@ class ImpactModeTestCase(django.test.TransactionTestCase):
                     maximum_distance='100')
         self.impact_run_then_remove('impact_run_with_shakemap', data)
 
+    def test_run_by_usgs_id_point_rupture_correlation(self):
+        # the GMFs are computed from the point rupture, not from a ShakeMap,
+        # so the within-event correlation model is really used
+        self.set_user_level_and_remove_groups(1)
+        data = dict(usgs_id='us6000phrk', approach='use_pnt_rup_from_usgs',
+                    use_shakemap='false', maximum_distance='100',
+                    calculation_mode='scenario',
+                    time_event='day', truncation_level='3',
+                    number_of_ground_motion_fields='10',
+                    asset_hazard_distance='15', ses_seed='42',
+                    within_event_correlation_model='JayaramBaker2009',
+                    within_event_correlation_params=(
+                        '{"vs30_clustering": False}'))
+        with tempfile.TemporaryDirectory() as email_dir:
+            data['email_file_path'] = email_dir
+            resp = self.post('impact_run', data=data)
+            [job_id] = json.loads(resp.content.decode('utf8'))
+            job_dic = self.wait(job_id)
+            if job_dic is None:
+                raise TimeoutError()
+            if job_dic['status'] == 'failed':
+                tb = self.get_json('%s/traceback' % job_id)
+                raise Exception('\n'.join(tb))
+            self.assertEqual(job_dic['status'], 'complete')
+            ret = self.post('%s/remove' % job_id)
+            self.assertEqual(ret.status_code, 200)
+
     def test_run_by_usgs_id_then_remove_calc_no_rupture(self):
         self.set_user_level_and_remove_groups(1)
         usgs_id = 'us6000phrk'
@@ -504,6 +552,15 @@ class ImpactModeTestCase(django.test.TransactionTestCase):
                     maximum_distance='100', make_impact_reports=True)
         self.impact_run_then_remove('impact_run_with_shakemap', data)
 
+    def test_level_1_maximum_distance_too_large(self):
+        self.set_user_level_and_remove_groups(1)
+        data = dict(usgs_id='us6000phrk', maximum_distance='501')
+        resp = self.post('impact_run', data=data)
+        self.assertEqual(resp.status_code, 400)
+        js = json.loads(resp.content.decode('utf8'))
+        self.assertEqual(js['invalid_inputs'], ['maximum_distance'])
+        self.assertIn('cannot exceed 500 km', js['error_msg'])
+
     # check that the URL 'run' cannot be accessed in IMPACT mode
     def test_can_not_run_normal_calc(self):
         self.set_user_level_and_remove_groups(1)
@@ -527,7 +584,7 @@ class ImpactModeTestCase(django.test.TransactionTestCase):
                          'local_timestamp', 'time_event', 'dip', 'strike',
                          'maximum_distance', 'truncation_level',
                          'number_of_ground_motion_fields',
-                         'asset_hazard_distance',
+                         'asset_hazard_distance', 'region_grid_spacing',
                          'ses_seed', 'station_data_file_from_usgs',
                          'station_data_file', 'maximum_distance_stations',
                          'msr', 'rupture_was_loaded', 'rupture_file_input',

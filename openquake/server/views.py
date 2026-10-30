@@ -21,7 +21,6 @@ import ast
 import csv
 import shutil
 import json
-import string
 import pickle
 import logging
 import os
@@ -55,7 +54,7 @@ from openquake.hazardlib import nrml, gsim, valid
 from openquake.hazardlib.scalerel import get_available_magnitude_scalerel
 from openquake.hazardlib.shakemap.validate import (
     impact_validate, IMPACT_FORM_LABELS, IMPACT_FORM_PLACEHOLDERS,
-    IMPACT_FORM_DEFAULTS, IMPACT_APPROACHES)
+    IMPACT_FORM_DEFAULTS, IMPACT_APPROACHES, MAX_DISTANCE_LEVEL1)
 from openquake.hazardlib.shakemap.parsers import (
     get_stations_from_usgs, get_shakemap_versions, get_nodal_planes_and_info)
 from openquake.commonlib import readinput, oqvalidation, logs, datastore, dbapi
@@ -82,7 +81,6 @@ if settings.LOCKDOWN:
     from django.contrib.auth import authenticate, login, logout
 
 UTC = timezone.utc
-CWD = os.path.dirname(__file__)
 METHOD_NOT_ALLOWED = 405
 NOT_IMPLEMENTED = 501
 
@@ -99,7 +97,6 @@ ACCESS_HEADERS = {'Access-Control-Allow-Origin': '*',
                   'Access-Control-Max-Age': 1000,
                   'Access-Control-Allow-Headers': '*'}
 
-KUBECTL = "kubectl apply -f -".split()
 ENGINE = "python -m openquake.engine.engine".split()
 
 AELO_FORM_LABELS = {
@@ -553,16 +550,23 @@ def calc_list(request, id=None):
         utils.get_valid_users(request),
         not utils.is_superuser(request), id)
     response_data = []
-    username = psutil.Process(os.getpid()).username()
+    username = utils.get_username(request)
+    superuser = utils.is_superuser(request)
+    can_share_own_jobs = (
+        get_user_level(request) >= 2 or
+        request.user.has_perm('auth.can_share_own_jobs'))
+    process_username = psutil.Process(os.getpid()).username()
     for (hc_id, owner, status, calculation_mode, is_running, desc, pid,
          parent_id, size_mb, host, start_time, relevant, tags) in calc_data:
+        can_manage_sharing = superuser or (
+            owner == username and can_share_own_jobs)
         if settings.DISPLAY_USER_HOST and host:
             owner += '@' + host.split('.')[0]
         url = urljoin(base_url, 'v1/calc/%d' % hc_id)
         abortable = False
         if is_running:
             try:
-                if psutil.Process(pid).username() == username:
+                if psutil.Process(pid).username() == process_username:
                     abortable = True
             except psutil.NoSuchProcess:
                 pass
@@ -573,6 +577,7 @@ def calc_list(request, id=None):
             dict(id=hc_id, owner=owner,
                  calculation_mode=calculation_mode, status=status,
                  is_running=bool(is_running), description=desc, url=url,
+                 can_manage_sharing=can_manage_sharing,
                  parent_id=parent_id, abortable=abortable, size_mb=size_mb,
                  start_time=start_time_str, relevant=relevant, tags=tags))
 
@@ -624,8 +629,19 @@ def calc_remove(request, calc_id):
         internal_api.calc_remove, int(calc_id), user)
 
 
-def share_job(user_level, calc_id, share):
-    if user_level < 2:
+def share_job(request, calc_id, share):
+    user_level = get_user_level(request)
+    superuser = utils.is_superuser(request)
+    if (user_level < 2 and not superuser and
+            not request.user.has_perm('auth.can_share_own_jobs')):
+        return HttpResponseForbidden()
+    try:
+        job = logs.dbcmd('get_job', calc_id)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    if job is None:
+        return HttpResponseNotFound()
+    if not superuser and job.user_name != utils.get_username(request):
         return HttpResponseForbidden()
     try:
         message = logs.dbcmd('share_job', calc_id, share)
@@ -748,8 +764,7 @@ def calc_unshare(request, calc_id):
     """
     Unshare the calculation of the given id
     """
-    user_level = get_user_level(request)
-    return share_job(user_level, calc_id, share=False)
+    return share_job(request, calc_id, share=False)
 
 
 @csrf_exempt
@@ -759,8 +774,7 @@ def calc_share(request, calc_id):
     """
     Share the calculation of the given id
     """
-    user_level = get_user_level(request)
-    return share_job(user_level, calc_id, share=True)
+    return share_job(request, calc_id, share=True)
 
 
 def log_to_json(log):
@@ -1278,6 +1292,92 @@ def extract_report_from_datastore(dstore, iso3, file_format):
     return bytes(data)
 
 
+# Resolve API routes by name so generated URLs respect any URL prefix.
+def _impact_output_url(request, route_name, calc_id, args=(), query=None):
+    url = request.build_absolute_uri(
+        reverse(route_name, args=[calc_id, *args]))
+    if query:
+        url += '?' + urlencode(query)
+    return url
+
+
+def build_impact_resources(request, calc_id, dstore):
+    """Describe impact resources and their presentation URLs."""
+    available = internal_api.get_impact_resource_data(dstore)
+    outputs = {
+        'avg_gmf_plots': {
+            imt: _impact_output_url(
+                request, 'download_png', calc_id, [name])
+            for imt, name in available['avg_gmf_plots'].items()},
+        'assets': None,
+        'aggrisk': None,
+        'aggrisk_tags': None,
+        'exposure_by_mmi': None,
+        'exposure_by_lse': {},
+        'country_reports': {},
+    }
+    if available['assets']:
+        outputs['assets'] = dict(png=_impact_output_url(
+            request, 'download_png', calc_id, ['assets.png']))
+    if available['aggrisk']:
+        outputs['aggrisk'] = dict(csv=_impact_output_url(
+            request, 'download_aggrisk', calc_id))
+    if available['aggrisk_tags']:
+        outputs['aggrisk_tags'] = dict(
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['aggrisk_tags']),
+            summary_table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['aggrisk_tags'],
+                dict(summarize=1)),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['aggrisk_tags']))
+    if available['exposure_by_mmi']:
+        outputs['exposure_by_mmi'] = dict(
+            json=_impact_output_url(
+                request, 'exposure_by_mmi', calc_id),
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['mmi_tags']),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['mmi_tags']))
+    for peril, is_available in available['exposure_by_lse'].items():
+        outputs['exposure_by_lse'][peril] = None
+        if not is_available:
+            continue
+        query = dict(secondary_peril=peril)
+        outputs['exposure_by_lse'][peril] = dict(
+            json=_impact_output_url(
+                request, 'exposure_by_lse', calc_id, query=query),
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id,
+                ['exposure_by_lse'], query),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['exposure_by_lse'],
+                query))
+    report_url = reverse('impact_report', args=[calc_id])
+    report_url = request.build_absolute_uri(report_url)
+    for iso3 in available['country_reports']:
+        urls = {}
+        for file_format in ('pdf', 'png'):
+            query = urlencode(dict(iso3=iso3, format=file_format))
+            urls[file_format] = f'{report_url}?{query}'
+        outputs['country_reports'][iso3] = urls
+    return outputs
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_impact_resources(request, calc_id):
+    """Return impact-specific resources and their retrieval URLs."""
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        resources = build_impact_resources(request, calc_id, ds)
+    return JsonResponse(resources)
+
+
 @csrf_exempt
 @cross_domain_ajax
 @require_http_methods(['GET'])
@@ -1498,18 +1598,9 @@ def submit_job(request_files, ini, username, hc_id, notify_to=None):
 
     custom_tmp = os.path.dirname(job_ini)
     submit_cmd = config.distribution.submit_cmd.split()
-    big_job = oq.get_input_size() > int(config.distribution.min_input_size)
     if submit_cmd == ENGINE:  # used for debugging
         for job in jobs:
             subprocess.Popen(submit_cmd + [save_pik(job, custom_tmp)])
-    elif submit_cmd == KUBECTL and big_job:
-        for job in jobs:
-            with open(os.path.join(CWD, 'job.yaml')) as f:
-                yaml = string.Template(f.read()).substitute(
-                    DATABASE='%(host)s:%(port)d' % config.dbserver,
-                    CALC_PIK=save_pik(job, custom_tmp),
-                    CALC_NAME='calc%d' % job.calc_id)
-            subprocess.run(submit_cmd, input=yaml.encode('ascii'))
     else:
         kwargs = {}
         if notify_to is not None:
@@ -1929,6 +2020,7 @@ def web_engine(request, **kwargs):
         params['impact_form_placeholders'] = IMPACT_FORM_PLACEHOLDERS
         params['impact_form_defaults'] = IMPACT_FORM_DEFAULTS
         params['impact_approaches'] = IMPACT_APPROACHES
+        params['impact_max_distance_level1'] = MAX_DISTANCE_LEVEL1
 
         # this is usually ''; can be set in the local settings for debugging
         params['impact_default_usgs_id'] = \
@@ -2205,7 +2297,9 @@ def format_oqparam(oqparam):
     if 'from_usgs' in approach:
         ret_dict[IMPACT_FORM_LABELS['usgs_id']] = rupdic['usgs_id']
         ret_dict[IMPACT_FORM_LABELS['shakemap_desc']] = rupdic['shakemap_desc']
-        ret_dict[IMPACT_FORM_LABELS['time_event']] = oqparam.time_event
+        # the time of the event selected by the user, used in the reports
+        ret_dict[IMPACT_FORM_LABELS['time_event']] = (
+            oqparam.report_time_event or oqparam.time_event)
 
     # e.g. from {'default': [[2.5, 150.0], [10.2, 150.0]]} to 150
     ret_dict[IMPACT_FORM_LABELS['maximum_distance']] = \
@@ -2257,6 +2351,26 @@ def format_oqparam(oqparam):
     return ret_dict
 
 
+def _get_impact_losses(ds):
+    # returns (losses, losses_header, weights_precision) for the table in
+    # the impact outputs page, or a message and None, None if the hazard
+    # is too low to compute the risk
+    try:
+        losses = views.view('aggrisk', ds)
+    except KeyError:
+        max_avg_gmf = ds['avg_gmf'][0].max()
+        msg = (f'The risk can not be computed since the hazard is too low:'
+               f' the maximum value of the average GMF is {max_avg_gmf:.5f}')
+        return msg, None, None
+    # the fatalities are displayed for day, night and transit, not on average
+    losses = losses[[n for n in losses.dtype.names if n != 'occupants_avg']]
+    # display only the descriptions, not the internal names of the fields
+    losses_header = [
+        AGGRISK_FIELD_DESCRIPTION.get(field, field.capitalize())
+        for field in losses.dtype.names]
+    return losses, losses_header, determine_precision(losses['weight'])
+
+
 @cross_domain_ajax
 @require_http_methods(['GET'])
 def web_engine_get_outputs_impact(request, calc_id):
@@ -2269,28 +2383,8 @@ def web_engine_get_outputs_impact(request, calc_id):
     local_timestamp_str = None
     time_job_after_event = None
     time_job_after_event_str = None
-    pngs = {}
     with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
-        try:
-            losses = views.view('aggrisk', ds)
-        except KeyError:
-            max_avg_gmf = ds['avg_gmf'][0].max()
-            losses = (
-                f'The risk can not be computed since the hazard is too low:'
-                f' the maximum value of the average GMF is {max_avg_gmf:.5f}')
-            losses_header = None
-            weights_precision = None
-        else:
-            losses_header = [
-                f'{field}<br><i>{AGGRISK_FIELD_DESCRIPTION[field]}</i>'
-                if field in AGGRISK_FIELD_DESCRIPTION
-                else field.capitalize()
-                for field in losses.dtype.names]
-            weights_precision = determine_precision(losses['weight'])
-        if 'png' in ds:
-            pngs['avg_gmf'] = [k for k in ds['png']
-                               if k.startswith('avg_gmf-')]
-            pngs['assets'] = 'assets.png' in ds['png']
+        losses, losses_header, weights_precision = _get_impact_losses(ds)
         oqparam = ds['oqparam']
         input_params = format_oqparam(oqparam)
         usgs_id = None
@@ -2300,23 +2394,9 @@ def web_engine_get_outputs_impact(request, calc_id):
             local_timestamp_str = (
                 oqparam.local_timestamp if oqparam.local_timestamp != 'None'
                 else None)
-        if 'impact' in ds:
-            impact_iso3_list = list(ds['impact'])
-        else:
-            impact_iso3_list = []
+        impact_resources = build_impact_resources(request, calc_id, ds)
     size_mb = '?' if job.size_mb is None else '%.2f' % job.size_mb
     warnings = get_impact_warnings(ds)
-    mmi_tags = 'mmi_tags' in ds
-    exposure_by_liq_lse = 'exposure_by_liquefaction_lse' in ds
-    exposure_by_land_lse = 'exposure_by_landslide_lse' in ds
-    # NOTE: aggrisk_tags is not available as an attribute of the datastore
-    try:
-        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
-            _extract(ds, 'aggrisk_tags')
-    except KeyError:
-        aggrisk_tags = False
-    else:
-        aggrisk_tags = True
     if local_timestamp_str is not None:
         local_timestamp = datetime.strptime(
             local_timestamp_str, '%Y-%m-%d %H:%M:%S%z')
@@ -2331,12 +2411,7 @@ def web_engine_get_outputs_impact(request, calc_id):
                        size_mb=size_mb, losses=losses,
                        losses_header=losses_header,
                        weights_precision=weights_precision,
-                       pngs=pngs,
-                       warnings=warnings, mmi_tags=mmi_tags,
-                       impact_iso3_list=impact_iso3_list,
-                       aggrisk_tags=aggrisk_tags,
-                       exposure_by_liq_lse=exposure_by_liq_lse,
-                       exposure_by_land_lse=exposure_by_land_lse,
+                       warnings=warnings, impact_resources=impact_resources,
                        usgs_id=usgs_id, input_params=input_params)
                   )
 
@@ -2475,9 +2550,10 @@ def extract_html_table(request, calc_id, name):
         table_contents = table_contents[table_contents[:, 0] == '*total*'][
             :, 1:-2]
 
-        # NOTE: Intentionally excluding embodied_carbon from this summary
-        table_contents = table_contents[
-            table_contents[:, 0] != 'embodied_carbon']
+        # NOTE: Intentionally excluding embodied_carbon and the average
+        # occupants (the fatalities are shown for day, night and transit)
+        table_contents = table_contents[~numpy.isin(
+            table_contents[:, 0], ['embodied_carbon', 'occupants_avg'])]
 
         # replace the following rows with their sum (economic loss)
         rows_to_sum = ['structural', 'nonstructural', 'contents']
@@ -2487,6 +2563,8 @@ def extract_html_table(request, calc_id, name):
             ([numpy.str_('economic')], summed))
         remaining = table_contents[~mask]
         table_contents = numpy.vstack([remaining, economic_loss_row])
+        # explain only the loss types displayed in the summary
+        displayed = set(table_contents[:, 0])
         for key, value in AGGRISK_FIELD_DESCRIPTION.items():
             table_contents[table_contents == key] = value
         loss_types = '<ul>' + ''.join(
@@ -2494,6 +2572,7 @@ def extract_html_table(request, calc_id, name):
                 AGGRISK_FIELD_DESCRIPTION.get(key, key), explanation,
                 '<span>.</span>' if key == 'injured' else '.')
             for key, explanation in AGGRISK_FIELD_EXPLANATION.items()
+            if key in displayed
         ) + '</ul>'
         additional_explanations = {
             'value': (

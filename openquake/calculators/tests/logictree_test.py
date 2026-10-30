@@ -18,10 +18,12 @@
 
 import sys
 import unittest
+from unittest import mock
 import numpy
 from openquake.baselib import general, config
 from openquake.baselib.general import decode
-from openquake.hazardlib import source_group, InvalidFile, rmap_maker
+from openquake.hazardlib import (
+    source_group, source_reader, InvalidFile, rmap_maker)
 from openquake.hazardlib.calc.mean_rates import (
     to_rates, to_probs)
 from openquake.commonlib import readinput
@@ -342,6 +344,12 @@ hazard_uhs-std.csv
         [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_curve-mean_bis.csv', fname)
 
+        # the cfactor counts the contexts once, also for the MFD variants
+        # computed together by make_results (it was 225 = 9 x 25)
+        nctxs = self.calc.datastore.read_df('source_data').nctxs.sum()
+        self.assertEqual(nctxs, 25)
+        self.assertEqual(self.calc.cfactor[0], nctxs)
+
     def test_gids_numbering(self):
         # the gids of the cmakers must be numbered as the core list, the
         # one used by read_gid_dic in the master, otherwise the rates are
@@ -519,6 +527,12 @@ hazard_uhs-std.csv
         self.run_calc(case_23.__file__, 'correlated.ini')
         [fname] = export(('hmaps/mean', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_map-corr-PGA.csv', fname)
+
+    def test_case_23_strided(self):
+        # the striding must be disabled with correlated uncertainties,
+        # since check_correlated needs the full groups
+        with mock.patch.object(source_reader, 'BIG_FILE', 0):
+            self.test_case_23_bis()
         ns = len(self.calc.datastore['source_info'])
         # with the uncertainties applied in the workers there is one row
         # per base source and no ';i' suffix for the 7 sources modified by
@@ -628,6 +642,7 @@ hazard_uhs-std.csv
     def test_case_30(self):
         # point on the international data line
         # this is also a test with IMT-dependent weights
+        # Source grids and fault traces are trimmed to reduce runtime.
         if sys.platform != 'darwin':  # broken on macOS
             self.assert_curves_ok(['hazard_curve-PGA.csv',
                                    'hazard_curve-SA(1.0).csv'],

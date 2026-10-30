@@ -53,7 +53,7 @@ from openquake.baselib.performance import Monitor
 from openquake.baselib.general import (
     random_filter, countby, get_duplicates, check_extension, gettemp,
     AccumDict)
-from openquake.baselib.general import decode
+from openquake.baselib.general import decode, gc_disabled
 from openquake.baselib.node import Node
 from openquake.hazardlib.const import StdDev
 from openquake.hazardlib.geo.packager import fiona
@@ -69,6 +69,7 @@ from openquake.hazardlib.source.rupture import (
     build_planar_rupture_from_dict, get_ruptures, get_ebrupture)
 from openquake.hazardlib.map_array import MapArray
 from openquake.hazardlib.geo.utils import hex6
+from openquake.hazardlib.geo.regular_grid import regular_grid
 from openquake.hazardlib.shakemap.parsers import convert_to_oq_xml
 from openquake.hazardlib.countries import country2code, MODELS, ALIASES
 from openquake.pfd.gsim import get_pfd_gsim_lt
@@ -568,9 +569,12 @@ def get_mesh_exp(oqparam, h5=None):
     """
     exposure = get_exposure(oqparam, h5)
     if oqparam.impact:
+        # the sites are a regular grid enclosing the site model around
+        # the rupture, as required by circulant embedding; the site model
+        # parameters are associated to the grid in base.py
         sm = get_site_model(oqparam, h5)
         mesh = geo.Mesh(sm['lon'], sm['lat'])
-        return mesh, exposure
+        return regular_grid(mesh, oqparam.region_grid_spacing), exposure
     if oqparam.sites:
         mesh = geo.Mesh.from_coords(oqparam.sites)
         return mesh, exposure
@@ -859,15 +863,12 @@ def get_site_collection(oqparam, h5=None):
             req_site_params = set()   # no parameters are required
         else:
             req_site_params = oqparam.req_site_params
-        if h5 and 'site_model' in h5:
+        if oqparam.impact:
+            # the grid is not the site model: the parameters are associated
+            # to the sites in base.py
+            sm = None
+        elif h5 and 'site_model' in h5:
             sm = h5['site_model'][:]
-        elif oqparam.impact and (
-                    not oqparam.infrastructure_connectivity_analysis):
-            # filter the far away sites
-            rup = get_rupture(oqparam)
-            dist = oqparam.maximum_distance('*')(rup.mag)
-            [expo_hdf5] = oqparam.inputs['exposure']
-            sm = get_site_model_around(expo_hdf5, rup, dist)
         elif (not h5 and 'site_model' in oqparam.inputs and
               'exposure' not in oqparam.inputs):
             # tested in test_with_site_model
@@ -1153,10 +1154,18 @@ def get_full_lt(oqparam):
     elif ('classical' in oqparam.calculation_mode
           and oqparam.calculation_mode != 'displacement'):  # full enum
         if not oqparam.fastmean and p > oqparam.max_potential_paths:
+            # use_rates helps only when computing the mean, i.e. without
+            # quantiles, individual realizations or site labels
+            if oqparam.use_rates:
+                rates = ('use_rates=true is not enough: it works only when '
+                         'computing the mean, i.e. without quantiles, '
+                         'individual realizations or site labels')
+            else:
+                rates = 'or set use_rates=true (only when computing the mean)'
             raise ValueError(
-                'There are too many potential logic tree paths (%d):'
+                'There are too many potential logic tree paths (%d): '
                 'raise `max_potential_paths`, use sampling instead of '
-                'full enumeration, or set use_rates=true ' % p)
+                'full enumeration, %s' % (p, rates))
     if source_model_lt.is_source_specific:
         logging.info('There is a source specific logic tree')
     return full_lt
@@ -1225,9 +1234,16 @@ def get_composite_source_model(oqparam, dstore=None):
     elif 'source_model' in oqparam.inputs:
         logging.info('Reading %s', oqparam.inputs['source_model'])
     full_lt = get_full_lt(oqparam)
-    csm = source_reader.get_csm(oqparam, full_lt, dstore)
-    _check_csm(csm, oqparam, dstore)
-    oqparam.mags_by_trt = csm.get_mags_by_trt(oqparam.maximum_distance)
+    # the garbage collector is disabled while building and checking the
+    # composite source model, since it would traverse many times the
+    # millions of objects created by _merge_strides, add_bangs,
+    # build_groups, etc. (the unpickling is managed in
+    # parallel.Result.get): in AUS this reduces the time from ~135 to ~90
+    # seconds without increasing the memory
+    with gc_disabled():
+        csm = source_reader.get_csm(oqparam, full_lt, dstore)
+        _check_csm(csm, oqparam, dstore)
+        oqparam.mags_by_trt = csm.get_mags_by_trt(oqparam.maximum_distance)
     return csm
 
 
@@ -1393,7 +1409,8 @@ def get_exposure(oqparam, h5=None):
                 # used in the tests
                 loss_types = f['crmAfrica'].attrs['loss_types']
                 oq.all_cost_types = loss_types
-                oq.minimum_asset_loss = {lt: 0 for lt in loss_types}
+                # use oq.loss_types to include the occupants_<time_event>
+                oq.minimum_asset_loss = {lt: 0 for lt in oq.loss_types}
     else:
         exposure = asset.Exposure.read_all(
             oq.inputs['exposure'], oq.calculation_mode,

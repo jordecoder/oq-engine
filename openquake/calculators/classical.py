@@ -36,7 +36,7 @@ from openquake.hazardlib.source_reader import (
     get_bset_values, modified_groups)
 from openquake.hazardlib.rmap_maker import read_core_trt_smrs
 from openquake.hazardlib.lt import (
-    get_ts_sets, get_bset_value, GEOMETRY_PRESERVING)
+    get_bset_value, GEOMETRY_PRESERVING)
 from openquake.hazardlib.rmap_maker import (
     get_cmakers, read_full_lt_by_label, make_results, mag_support)
 from openquake.hazardlib.calc.filters import FilteredAway
@@ -188,21 +188,34 @@ def baseclassical(grp, tgetter, cmaker, remove_zeros, dstore=None,
     return result
 
 
-_full_lt_cache = {}  # dstore filename -> initialized FullLogicTree
+_full_lt_cache = {}  # (dstore filename, ilabel) -> initialized FullLogicTree
 
 
-def read_full_lt(dstore):
+def read_full_lt(dstore, ilabel=None):
     """
+    :param dstore: a DataStore instance, possibly closed
+    :param ilabel: the index of the site label (see site_labels), or None
     :returns: the FullLogicTree stored in the datastore, initialized only
-        once per process, since the init is not cheap for large LTs
+        once per process, since the init is not cheap for large LTs;
+        with a site label, the gsim logic tree is the one of the label,
+        so that the gweights are the right ones (see read_gid_dic)
     """
-    filename = dstore.filename
+    key = (dstore.filename, ilabel or 0)
     try:
-        return _full_lt_cache[filename]
+        return _full_lt_cache[key]
     except KeyError:
+        # keep only the logic trees of the current calculation, otherwise
+        # the cache would grow forever in long-lived worker processes
+        for k in [k for k in _full_lt_cache if k[0] != dstore.filename]:
+            del _full_lt_cache[k]
         with dstore:
             full_lt = dstore['full_lt'].init()
-        _full_lt_cache[filename] = full_lt
+            if ilabel:
+                # the labels are ordered as the cmdict, i.e. Default first;
+                # tested in classical/case_06_disagg_by_src
+                dic = read_full_lt_by_label(dstore, full_lt)
+                full_lt = list(dic.values())[ilabel]
+        _full_lt_cache[key] = full_lt
         return full_lt
 
 
@@ -239,7 +252,7 @@ def group_gids(src_groups, gid_dic):
     for grp in src_groups:
         gids = set()
         for src in grp:
-            for trt_smrs in get_ts_sets(src):
+            for trt_smrs in src.get_ts_sets():
                 gids.update(gid_dic[trt_smrs][0])
         out[grp.grp_id] = U32(sorted(gids))
     return out
@@ -300,10 +313,22 @@ def geometry_key(srcs, bvals):
     # e.g. logictree/case_18_bis: the sources of 'first' have two keys, one
     # for setLowerSeismDepthAbsolute 10.0 and one for 20.0, with 9 sets each
     # (3 abGR x 3 maxMagGR), i.e. two groups of 9 variants for make_results:
-    #   (('bs6', '10.0'),) and (('bs6', '20.0'),)
-    return tuple((bset.id, repr(value)) for bset, value in bvals
-                 if bset.uncertainty_type not in GEOMETRY_PRESERVING and
-                 any(get_bset_value(bset, value, src)[0] for src in srcs))
+    # (('setLowerSeismDepthAbsolute', '10.0', ids),) and
+    # (('setLowerSeismDepthAbsolute', '20.0', ids),), with ids the IDs of
+    # the sources of 'first'
+    # NB: the key uses the uncertainty type and the affected sources and not
+    # the branchset ID, since the same uncertainty with the same value gives
+    # the same geometry even if it comes from different branchsets, i.e.
+    # from different source models containing the same source
+    key = []
+    for bset, value in bvals:
+        if bset.uncertainty_type in GEOMETRY_PRESERVING:
+            continue
+        ids = tuple(src.source_id for src in srcs
+                    if get_bset_value(bset, value, src)[0])
+        if ids:
+            key.append((bset.uncertainty_type, repr(value), ids))
+    return tuple(key)
 
 
 def _split_by_mags(pairs):
@@ -354,8 +379,33 @@ def _make_results(pairs, sites, remove_zeros, as_rmap):
     return dics
 
 
+def _atomic_results(grps, sites, cmaker, remove_zeros, as_rmap,
+                    merge_atomic):
+    # yield the results of the atomic groups collapsed in a single
+    # task (see get_allargs and bysrc_results); they contribute to the
+    # same RateMap in the master, with the gids of all the
+    # realizations; the uncertainties are not applied, which is fine
+    # because the sources of an atomic group are nonparametric (the
+    # mutex ones must be, since mutually exclusive ruptures are
+    # modelled with nonparametric sources)
+    if merge_atomic:
+        # with many sites there are no rup_data nor mean_rates_by_src
+        yield baseclassical(grps, sites, cmaker, remove_zeros,
+                            as_rmap=as_rmap)
+    else:
+        # one result per group, since the rates are attributed to the
+        # source of each result (see 'basename' in RmapMaker.make) and
+        # the rup_data of different groups cannot be concatenated
+        # (different shapes of probs_occur); the groups are
+        # independent, so the sum of the results is the same;
+        # tested in classical/case_27_other and disagg/case_18
+        for grp in grps:
+            yield baseclassical([grp], sites, cmaker, remove_zeros,
+                                as_rmap=as_rmap)
+
+
 def bysrc_results(grps, sites, cmaker, gid_dic, full_lt, remove_zeros,
-                  as_rmap=True):
+                  as_rmap=True, merge_atomic=True):
     """
     Yield the results of a classical task as RateMaps: the CSM is built without
     applying the uncertainties, so cmakers_groups_gkeys applies them one
@@ -370,17 +420,12 @@ def bysrc_results(grps, sites, cmaker, gid_dic, full_lt, remove_zeros,
     :param remove_zeros: if True the sites with zero rates are removed
     :param as_rmap: if False the rates are returned as arrays of rates,
         stored right away by the master, see baseclassical
+    :param merge_atomic: if True the atomic groups of the task are
+        returned in a single result, otherwise in a result per group
     """
     if len(grps) > 1:
-        # the atomic groups collapsed in a single task (see get_allargs)
-        # contribute to the same RateMap in the master, so they must be
-        # returned in a single result, with the gids of all the
-        # realizations; the uncertainties are not applied, which is fine
-        # because the sources of an atomic group are nonparametric (the
-        # mutex ones must be, since mutually exclusive ruptures are
-        # modelled with nonparametric sources) and no uncertainty can be
-        # applied to a nonparametric source (the calculation would fail)
-        yield baseclassical(grps, sites, cmaker, remove_zeros, as_rmap=as_rmap)
+        yield from _atomic_results(grps, sites, cmaker, remove_zeros,
+                                   as_rmap, merge_atomic)
         return
     grp = grps[0]
     if grp.atomic:
@@ -398,7 +443,7 @@ def bysrc_results(grps, sites, cmaker, gid_dic, full_lt, remove_zeros,
         # same uncertainties, are computed together; otherwise there
         # would be a RateMap per source and with many sites that would be
         # extremely slow (share_small)
-        srcblocks = groupby(grp, get_ts_sets).values()
+        srcblocks = groupby(grp, operator.methodcaller('get_ts_sets')).values()
     for srcs in srcblocks:
         # for the demo LogicTreeCase2ClassicalPSHA srcs is
         # [<AreaSource first>] and then [<SimpleFaultSource second>]
@@ -466,9 +511,12 @@ def read_task_input(grp_keys, tilegetter, cmaker, dstore, monitor):
     # NB: the datastore is closed when passed to a task, see read_gid_dic;
     # full_lt is read from the datastore, since it is too big to be passed
     # to the tasks
-    # NB: the tilegetter is trivial unless there are site labels
+    # NB: the tilegetter is trivial unless there are site labels;
+    # the gweights depend on the label, see get_rates and
+    # classical/case_06_disagg_by_src
+    full_lt = read_full_lt(dstore, cmaker.ilabel)
     return (grps, tilegetter(sitecol, cmaker.ilabel),
-            read_gid_dic(dstore), read_full_lt(dstore))
+            read_gid_dic(dstore, full_lt), full_lt)
 
 
 def classical_bysrc(grp_keys, tilegetter, cmaker, dstore, monitor):
@@ -484,8 +532,13 @@ def classical_bysrc(grp_keys, tilegetter, cmaker, dstore, monitor):
     """
     grps, sites, gid_dic, full_lt = read_task_input(
         grp_keys, tilegetter, cmaker, dstore, monitor)
-    yield from bysrc_results(grps, sites, cmaker, gid_dic, full_lt,
-                             remove_zeros=False)
+    # the RateMap in the master is the one of the first group (see
+    # get_rmap), also for the results of the other atomic groups
+    rmap_id = int(grp_keys[0].split('-')[0])
+    for dic in bysrc_results(grps, sites, cmaker, gid_dic, full_lt,
+                             remove_zeros=False, merge_atomic=False):
+        dic['rmap_id'] = rmap_id
+        yield dic
 
 
 def classical(grp_keys, tilegetter, cmaker, dstore, monitor):
@@ -519,12 +572,12 @@ def classical(grp_keys, tilegetter, cmaker, dstore, monitor):
     yield baseclassical(b0, sites, cmaker, remove_zeros, as_rmap=as_rmap)
     dt = time.time() - t0
     # NB: the tasks generated below are called baseclassical, i.e. they
-    # have a different name than the Starmap (classical), hence the times
-    # are stored in a separate row of the starmap_info dataset; this is
-    # what repairs the stragglers when the initial split underestimates the
+    # have a different name than the Starmap (classical), but their busy
+    # times are summed to the classical ones in the starmap_info dataset;
+    # this is what repairs the stragglers when the initial split underestimates the
     # cost of a group. The split is not triggered by the tests, since they
     # have few sites; the reference test is classical/share_small in
-    # oq-risk-tests (split_time = 5)
+    # oq-risk-tests (split_time = 2)
     if dt > 2 * oq.split_time:
         for blk in blks[1:]:
             yield baseclassical, blk, tilegetter, cmaker, remove_zeros, dstore
@@ -558,6 +611,12 @@ def fast_mean(pgetter, monitor=parallel.Monitor()):
         # computing the hmaps is very fast too
         pmap_by_kind['hmaps-stats'] = calc.make_hmaps(
             pmap_by_kind['hcurves-stats'], pgetter.imtls, pgetter.poes)
+    if pgetter.R == 1:
+        # Individual outputs are always created for a single realization,
+        # whose curves and maps coincide with the mean.
+        pmap_by_kind['hcurves-rlzs'] = pmap_by_kind['hcurves-stats']
+        if pgetter.poes:
+            pmap_by_kind['hmaps-rlzs'] = pmap_by_kind['hmaps-stats']
     return pmap_by_kind
 
 
@@ -660,13 +719,17 @@ def make_hmap_png(hmap, lons, lats):
 
 
 # used in in disagg_by_src
-def get_rates(rmap, M, itime):
+def get_rates(rmap, gweights, itime):
     """
     :param rmap: a MapArray
+    :param gweights: weights of shape (Gt, M), in the order of oq.imtls
+    :param itime: investigation time used to convert to annual rates
     :returns: an array of rates of shape (N, M, L1)
     """
-    rates = rmap.array @ rmap.wei / itime
-    return rates.reshape((len(rates), M, -1))
+    weights = gweights[rmap.gid]
+    G, M = weights.shape
+    rates = rmap.array.reshape((len(rmap.array), M, -1, G))
+    return numpy.einsum('nmlg,gm->nml', rates, weights) / itime
 
 
 def store_mean_rates_by_src(dstore, srcidx, dic):
@@ -692,6 +755,7 @@ class ClassicalCalculator(base.HazardCalculator):
     precalc = 'preclassical'
     accept_precalc = ['preclassical', 'classical']
     SLOW_TASK_ERROR = False
+    MIN_EFFICIENCY = .7  # mean / max of the busy times per core
 
     def agg_dicts(self, acc, dic):
         """
@@ -728,8 +792,8 @@ class ClassicalCalculator(base.HazardCalculator):
         if source_id:
             # accumulate the rates for the given source
             oq = self.oqparam
-            M = len(oq.imtls)
-            acc[source_id] += get_rates(rmap, M, oq.investigation_time)
+            acc[source_id] += get_rates(
+                rmap, self.gweights, oq.investigation_time)
         if rmap is None:
             # already stored in the workers, case_22
             pass
@@ -739,8 +803,10 @@ class ClassicalCalculator(base.HazardCalculator):
                 chunkno = dic.get('chunkno')  # None with the current impl.
                 _store(rmap, self.num_chunks, self.datastore, chunkno)
         else:
-            # aggregating rates is ultra-fast compared to storing
-            self.rmap[grp_id] += rmap
+            # aggregating rates is ultra-fast compared to storing; NB: the
+            # results of the atomic groups go in the RateMap of the first
+            # group of the task, see classical_bysrc
+            self.rmap[dic.pop('rmap_id', grp_id)] += rmap
         return acc
 
     def create_rup(self):
@@ -805,6 +871,14 @@ class ClassicalCalculator(base.HazardCalculator):
         self.source_mb = 0
         self.rel_ruptures = AccumDict(accum=0)  # grp_id -> rel_ruptures
         if oq.disagg_by_src:
+            # disagg_by_src uses a single site label, checked in _pre_execute.
+            # Select each IMT's weights, including the default for other IMTs.
+            ilabel = self.sitecol.ilabel[0] if oq.site_labels else 0
+            full_lt = list(full_lt_by_label.values())[ilabel]
+            weights = full_lt.g_weights(core)
+            wget = full_lt.gsim_lt.wget
+            self.gweights = numpy.array(
+                [wget(weights, imt) for imt in oq.imtls]).T
             M = len(oq.imtls)
             L1 = oq.imtls.size // M
             sources = self.csm.get_basenames()
@@ -866,8 +940,8 @@ class ClassicalCalculator(base.HazardCalculator):
             raise InvalidFile('%(job_ini)s: you disabled all statistics',
                               oq.inputs)
         self.source_data = AccumDict(accum=[])
-        sgs, ds = self._pre_execute()
-        self._execute(sgs, ds)
+        ds = self._pre_execute()
+        self._execute(ds)
         if self.cfactor[0] == 0:
             if self.N == 1:
                 logging.error('The site is far from all seismic sources'
@@ -884,6 +958,13 @@ class ClassicalCalculator(base.HazardCalculator):
             logging.info('maximum size of the multifaults=%.1f MB',
                          self.source_mb)
         self.build_curves_maps()
+        # NB: the sanity check must come after build_curves_maps, since it
+        # needs hcurves-stats; the amplified curves have different levels;
+        # it would catch the bug in classical/case_06_disagg_by_src
+        if (oq.disagg_by_src and oq.use_rates and self.N == 1
+                and not self.amplifier):
+            self.check_mean_rates(
+                self.datastore['mean_rates_by_src/array'][()])
         return True
 
     def _pre_execute(self):
@@ -895,13 +976,12 @@ class ClassicalCalculator(base.HazardCalculator):
         if oq.disagg_by_src and oq.site_labels:
             assert len(numpy.unique(self.sitecol.ilabel)) == 1, \
                 'disagg_by_src not supported on splittable site collection'
-        sgs = self.datastore['source_groups']
         if 'sitecol' in self.datastore.parent:
             ds = self.datastore.parent
         else:
             ds = self.datastore
         self.create_rup()  # create the rup/ datasets BEFORE swmr_on()
-        return sgs, ds
+        return ds
 
     def get_rmap(self, grp_id, gids):
         """
@@ -920,9 +1000,10 @@ class ClassicalCalculator(base.HazardCalculator):
                 self.sitecol.sids, self.oqparam.imtls.size, gids[grp_id])
         return self.rmap[grp_id]
 
-    def _execute(self, sgs, ds):
+    def _execute(self, ds):
         oq = self.oqparam
         allargs = []
+        weights = []  # estimated weight of each task
         self.rmap = {}
         # in the case of many sites produce half the tasks
         data = get_allargs(self.csm, self.cmdict, self.sitecol,
@@ -939,17 +1020,18 @@ class ClassicalCalculator(base.HazardCalculator):
         # (as in case_36)
         gid_dic = read_gid_dic(ds, self.full_lt)
         gids = group_gids(self.csm.src_groups, gid_dic)
-        for cmaker, tilegetters, grp_keys, atomic in data:
+        for cmaker, tilegetters, grp_keys, atomic, grp_weights in data:
             num_blocks += sum('-' in key for key in grp_keys)
             # the rates are accumulated in a RateMap in the master, unless
             # the task returns an array of rates, i.e. unless there are
             # many sites and the groups are not split in blocks
             if self.few_sites or oq.disagg_by_src or len(grp_keys) > 1:
                 self.get_rmap(int(grp_keys[0].split('-')[0]), gids)
-            if self.few_sites or oq.disagg_by_src and cmaker.ilabel is None:
+            if self.few_sites or oq.disagg_by_src:
                 # NB: a group discarded by the prefiltering has no tiles
                 # at all, which is fine since it produces no rate; however
-                # two or more tiles would silently corrupt disagg_by_src
+                # two or more tiles would silently corrupt disagg_by_src,
+                # also with site labels (see get_rates)
                 assert len(tilegetters) <= 1, (
                     'disagg_by_src has %d tiles for group %s'
                     % (len(tilegetters), grp_keys))
@@ -961,11 +1043,14 @@ class ClassicalCalculator(base.HazardCalculator):
                     # JPN, send the grp_keys together, they will all send
                     # rates to the RateMap associated to the first grp_id
                     allargs.append((grp_keys, tgetter, cmaker, ds))
+                    weights.append(sum(grp_weights) / len(tilegetters))
                 else:
                     # send a grp_key at the time
-                    for grp_key in grp_keys:
+                    for grp_key, w in zip(grp_keys, grp_weights):
                         allargs.append(([grp_key], tgetter, cmaker, ds))
+                        weights.append(w / len(tilegetters))
             maxtiles = max(maxtiles, len(tilegetters))
+        allargs = parallel.heaviest_first(allargs, weights)
         if num_blocks and not self.few_sites:
             logging.info(f'{oq.split_time=:.0f} seconds')
         logging.warning('This is a calculation with %d tasks, maxtiles=%d, '
@@ -1000,12 +1085,14 @@ class ClassicalCalculator(base.HazardCalculator):
         if size_mb > 100:
             # tested in performance.zip
             L1 = oq.imtls.size // len(oq.imtls)
-            savemap = parallel.Starmap(save_rates, h5=self.datastore,
-                                       distribute='processpool')
-            for grp_id, rmap in self.rmap.items():
-                for rm in rmap.split(L1):
-                    savemap.submit((rm, self.num_chunks, None))
-            savemap.reduce()
+            with self.datastore.reopen('r'):  # read-only while saving
+                savemap = parallel.Starmap(
+                    save_rates, h5=self.datastore, perf='memory',
+                    distribute='processpool')
+                for grp_id, rmap in self.rmap.items():
+                    for rm in rmap.split(L1):
+                        savemap.submit((rm, self.num_chunks, None))
+                savemap.reduce()
         else:
             # store sequentially
             logging.info('Saving %d RateMap(s)', len(self.rmap))
@@ -1014,9 +1101,7 @@ class ClassicalCalculator(base.HazardCalculator):
                     _store(rmap.to_array(g), self.num_chunks, self.datastore)
 
         if oq.disagg_by_src:
-            mrs = store_mean_rates_by_src(self.datastore, self.srcidx, acc)
-            if oq.use_rates and self.N == 1:  # sanity check
-                self.check_mean_rates(mrs)
+            store_mean_rates_by_src(self.datastore, self.srcidx, acc)
 
     # NB: the largest mean_rates_by_src is SUPER-SENSITIVE to numerics!
     # in particular disaggregation/case_15 is sensitive to num_cores
@@ -1026,14 +1111,18 @@ class ClassicalCalculator(base.HazardCalculator):
         The sum of the mean_rates_by_src must correspond to the mean_rates
         """
         try:
-            exp = disagg.to_rates(self.datastore['hcurves-stats'][0, 0])
+            hcurves = self.datastore['hcurves-stats'][0, 0]
         except KeyError:  # if there are no ruptures close to the site
             return
+        # NB: the mean_rates_by_src are annual rates, see get_rates
+        exp = disagg.to_rates(hcurves) / self.oqparam.investigation_time
         got = mean_rates_by_src[0].sum(axis=2)  # sum over the sources
         for m in range(len(got)):
             # skipping large rates which can be wrong due to numerics
-            # (it happens in logictree/case_05 and in Japan)
-            ok = got[m] < 2.
+            # (it happens in logictree/case_05 and in Japan); the rates
+            # are compared in the investigation time, where the poes
+            # saturate (see to_rates)
+            ok = got[m] * self.oqparam.investigation_time < 2.
             numpy.testing.assert_allclose(got[m, ok], exp[m, ok], atol=1E-5)
 
     def store_info(self):
@@ -1082,8 +1171,8 @@ class ClassicalCalculator(base.HazardCalculator):
             if kind in self.hazard:
                 array = self.hazard[kind]
             else:
-                dset = self.datastore.getitem(kind)
-                array = self.hazard[kind] = numpy.zeros(dset.shape, dset.dtype)
+                shape, dtype = self.hazard_specs[kind]
+                array = self.hazard[kind] = numpy.zeros(shape, dtype)
             for r, pmap in enumerate(pmaps):
                 for idx, sid in enumerate(pmap.sids):
                     array[sid, r] = pmap.array[idx]  # shape (M, P)
@@ -1097,13 +1186,13 @@ class ClassicalCalculator(base.HazardCalculator):
         except hdf5.File.EmptyDataset:
             return
         # NB: the classical Starmap generates baseclassical subtasks when
-        # the tasks are too slow, so there can be two rows; the rows with
-        # a tiny mean are discarded, since the tasks are then so fast
-        # that the busy times are dominated by the startup of the worker
-        # processes, so the check below would be meaningless (see eshm20,
-        # with 0.15s of busy time per worker and a ratio of 1.5)
-        ser = info[info.index.isin([b'classical', b'baseclassical'])]
-        ser = ser[ser['mean'] >= 1]
+        # the tasks are too slow, but their busy times are already summed
+        # to the classical ones, so there is a single row per Starmap
+        ser = info[info.index.isin([b'classical'])]
+        # NB: with less than 4 seconds of busy time per worker the
+        # efficiency is dominated by the startup of the workers and it is
+        # meaningless, so the check is skipped (see eshm20)
+        ser = ser[ser['maxtime'] >= 4]
         if not len(ser):
             return
         # NB: the check is meaningful only if there are enough tasks to
@@ -1112,21 +1201,16 @@ class ClassicalCalculator(base.HazardCalculator):
         # source model logic tree branch and few sites, see the sslt test
         # in oq-risk-tests, with 2 tasks and 16 workers)
         ntasks = len(self.datastore['grp_keys'])
-        if ntasks < 4 * parallel.num_cores:
+        if ntasks < 2 * parallel.num_cores:
             logging.info('Only %d tasks for %d workers, not checking for '
                          'slow tasks', ntasks, parallel.num_cores)
             return
-        # NB: the ratio std/mean of the *busy times* of the workers
-        # measures how balanced the generated tasks are; since the
-        # tasks are built from an estimate of the cost, and the
-        # estimate cannot be exact, .3 is considered acceptable
-        # (see the alaska and sam_small tests in oq-risk-tests)
-        # NB: the rows are combined and not compared, since they are
-        # components of the busy time of the same workers; assuming the
-        # times spent on the different kinds of tasks are independent,
-        # the means add up and so do the variances
-        std = numpy.sqrt((ser['std'] ** 2).sum())
-        slow_tasks = std / ser['mean'].sum() > .3
+        # NB: the efficiency of the *busy times* of the workers measures
+        # how balanced the generated tasks are; since the tasks are built
+        # from an estimate of the cost, and the estimate cannot be exact,
+        # MIN_EFFICIENCY is considered acceptable (see the alaska and
+        # sam_small tests in oq-risk-tests)
+        slow_tasks = (ser['efficiency'] < self.MIN_EFFICIENCY).any()
         if slow_tasks and self.SLOW_TASK_ERROR:
             raise RuntimeError('Slow tasks in #%d' % self.datastore.calc_id)
         elif slow_tasks:
@@ -1165,32 +1249,35 @@ class ClassicalCalculator(base.HazardCalculator):
             logging.info('Producing %s of hazard curves', humansize(hcbytes))
         if hmbytes:
             logging.info('Producing %s of hazard maps', humansize(hmbytes))
-        if 'delta_rates' in oq.inputs:
-            # with delta_rates the datastore cannot be put in SWMR mode:
-            # the workers would read the rates while the master still writes
-            # them, so the postclassical tasks must run in the master process
-            distribute = 'no'
-        else:
-            distribute = None
-            self.datastore.swmr_on()
-        if oq.fastmean:
-            parallel.Starmap(
-                fast_mean, [args[0:1] for args in allargs],
-                distribute=distribute,
-                h5=self.datastore.hdf5,
-            ).reduce(self.collect_hazard)
-        else:
-            parallel.Starmap(
-                postclassical, allargs,
-                distribute=distribute,
-                h5=self.datastore.hdf5,
-            ).reduce(self.collect_hazard)
-        for kind in sorted(self.hazard):
-            logging.info('Saving %s', kind)  # very fast
-            self.datastore[kind][:] = self.hazard.pop(kind)
+        kinds = ('hcurves-stats', 'hcurves-rlzs',
+                 'hmaps-stats', 'hmaps-rlzs')
+        self.hazard_specs = {
+            kind: (self.datastore[kind].shape, self.datastore[kind].dtype)
+            for kind in kinds if kind in self.datastore}
+        # the datastore is read-only while the postclassical tasks run,
+        # the writes are done explicitly after the Starmap
+        with self.datastore.reopen('r'):
+            if oq.fastmean:
+                smap = parallel.Starmap(
+                    fast_mean, [args[0:1] for args in allargs],
+                    h5=self.datastore, perf='memory',
+                )
+            else:
+                smap = parallel.Starmap(
+                    postclassical, allargs,
+                    h5=self.datastore, perf='memory',
+                )
+            smap.reduce(self.collect_hazard)
+        with self.datastore.reopen('a'):
+            for kind in sorted(self.hazard):
+                logging.info('Saving %s', kind)  # very fast
+                self.datastore[kind][:] = self.hazard.pop(kind)
 
-        if 'hmaps-stats' in self.datastore and not oq.tile_spec:
-            self.plot_hmaps()
+        # Plotting and the stability check below both need mean outputs.
+        if ('mean' in hstats and 'hmaps-stats' in self.datastore
+                and not oq.tile_spec):
+            with self.datastore.reopen('a'):
+                self.plot_hmaps()
 
             # check numerical stability of the hmaps around the poes
             if self.N <= oq.max_sites_disagg and not self.amplifier:

@@ -46,8 +46,9 @@ def to_spectra(outdic, n, p):
     out = numpy.zeros((R, M, 2))
     for r in range(R):
         c = outdic[r]
-        out[r, :, 0] = numpy.exp(c[:, n, 1, p])  # NB: seems wrong!
-        out[r, :, 1] = numpy.sqrt(c[:, n, 2, p])
+        # normalize the moments by the total weight c[:, n, 0, p]
+        out[r, :, 0] = numpy.exp(c[:, n, 1, p] / c[:, n, 0, p])
+        out[r, :, 1] = numpy.sqrt(c[:, n, 2, p] / c[:, n, 0, p])
     return out
 
 
@@ -124,11 +125,11 @@ def compute_cs(dstore, oq, N, M, P):
     # Computing CS
     blocks, trt_rlzs = get_blocks(dstore, oq, cmakers,
                                   read_ctx_by_grp(dstore))
-    dstore.swmr_on()
-    smap = parallel.Starmap(get_cs_out, h5=dstore)
-    for cmaker, ctx, tom in blocks:
-        smap.submit((cmaker, ctx, imti, imls, tom))
-    out = smap.reduce()
+    with dstore.reopen('r'):  # read-only in the parallel phase
+        smap = parallel.Starmap(get_cs_out, h5=dstore, perf='memory')
+        for cmaker, ctx, tom in blocks:
+            smap.submit((cmaker, ctx, imti, imls, tom))
+        out = smap.reduce()
 
     # Apply weights and get two dictionaries with integer keys
     # (corresponding to the rlz ID) and array values
@@ -141,7 +142,8 @@ def compute_cs(dstore, oq, N, M, P):
 
     # sanity check: the mean conditional spectrum must be close to the imls
     ref_idx = list(oq.imtls).index(oq.imt_ref)
-    mean_cs = numpy.exp(outmean[0][ref_idx, :, 1, :])  # shape (N, P)
+    om = outmean[0][ref_idx]  # shape (N, 3, P)
+    mean_cs = numpy.exp(om[:, 1, :] / om[:, 0, :])  # shape (N, P)
     for n in range(N):
         for p in range(P):
             diff = abs(1. - imls[n, p]/ mean_cs[n, p])
@@ -152,7 +154,6 @@ def compute_cs(dstore, oq, N, M, P):
                                 mean_cs[n, p], imls[n, p])
 
     # Computing standard deviation
-    dstore.swmr_on()
     smap = parallel.Starmap(get_cs_out, h5=dstore.hdf5)
     for cmaker, ctx, tom in blocks:
         smap.submit((cmaker, ctx, imti, imls, tom, outmean[0]))

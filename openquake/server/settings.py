@@ -45,7 +45,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 WEBUI_USER = 'openquake'
 
 TEST = ('test' in sys.argv or any('pytest' in arg for arg in sys.argv)
-        or os.environ.get('GITHUB_ACTIONS'))
+        or os.environ.get('GITHUB_ACTIONS') or os.environ.get('OQ_TEST'))
 
 INSTALLED_APPS = ('openquake.server.db',)
 
@@ -87,9 +87,9 @@ STATICFILES_DIRS = [
 
 DATABASE = {
     'ENGINE': 'django.db.backends.sqlite3',
-    'NAME': os.path.expanduser(config.dbserver.file),
+    'NAME': os.path.expanduser(config.server.dbfile),
     'USER': getpass.getuser(),
-    'HOST': config.dbserver.host,
+    'HOST': config.server.host,
 }
 DATABASES = {'default': DATABASE}
 
@@ -339,6 +339,7 @@ if APPLICATION_MODE not in ('PUBLIC',):
         TEMPLATES[0]['OPTIONS']['context_processors'] = CONTEXT_PROCESSORS
     # add installed_apps for cookie-consent
     for app in ('django.contrib.auth', 'django.contrib.contenttypes',
+                'openquake.server.authorization',
                 'openquake.server.user_profile', 'cookie_consent',):
         if app not in INSTALLED_APPS:
             INSTALLED_APPS += (app,)
